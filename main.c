@@ -1,8 +1,8 @@
 /* main.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2014 David Anderson
+ * Copyright (C) 2002-2014 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@
 #include "xen_hyper_defs.h"
 #include <curses.h>
 #include <getopt.h>
+#include <sys/prctl.h>
 
 static void setup_environment(int, char **);
 static int is_external_command(void);
@@ -26,15 +27,15 @@ static int is_builtin_command(void);
 static int is_input_file(void);
 static void check_xen_hyper(void);
 static void show_untrusted_files(void);
+static void get_osrelease(char *);
+static void get_log(char *);
 
 static struct option long_options[] = {
         {"memory_module", required_argument, 0, 0},
         {"memory_device", required_argument, 0, 0},
         {"no_kallsyms", 0, 0, 0},
         {"no_modules", 0, 0, 0},
-        {"no_namelist_gzip", 0, 0, 0},
         {"help", optional_argument, 0, 'h'},
-	{"data_debug", 0, 0, 0},
 	{"no_data_debug", 0, 0, 0},
 	{"no_crashrc", 0, 0, 0},
 	{"no_kmem_cache", 0, 0, 0},
@@ -44,7 +45,6 @@ static struct option long_options[] = {
 	{"machdep", required_argument, 0, 0},
 	{"version", 0, 0, 0},
 	{"buildinfo", 0, 0, 0},
-	{"shadow_page_tables", 0, 0, 0},
         {"cpus", required_argument, 0, 0},
         {"no_ikconfig", 0, 0, 0},
         {"hyper", 0, 0, 0},
@@ -57,9 +57,19 @@ static struct option long_options[] = {
         {"CRASHPAGER", 0, 0, 0},
         {"no_scroll", 0, 0, 0},
         {"reloc", required_argument, 0, 0},
+	{"kaslr", required_argument, 0, 0},
 	{"active", 0, 0, 0},
 	{"minimal", 0, 0, 0},
 	{"mod", required_argument, 0, 0},
+	{"kvmhost", required_argument, 0, 0},
+	{"kvmio", required_argument, 0, 0},
+	{"no_elf_notes", 0, 0, 0},
+	{"osrelease", required_argument, 0, 0},
+	{"log", required_argument, 0, 0},
+	{"hex", 0, 0, 0},
+	{"dec", 0, 0, 0},
+	{"no_strip", 0, 0, 0},
+	{"hash", required_argument, 0, 0},
         {0, 0, 0, 0}
 };
 
@@ -67,6 +77,7 @@ int
 main(int argc, char **argv)
 {
 	int i, c, option_index;
+	char *tmpname;
 
 	setup_environment(argc, argv);
 
@@ -75,7 +86,7 @@ main(int argc, char **argv)
 	 */
 	opterr = 0;
 	optind = 0;
-	while((c = getopt_long(argc, argv, "Lkgh::e:i:sSvc:d:tfp:m:x",
+	while((c = getopt_long(argc, argv, "Lkgh::e:i:sSvc:d:tfp:m:xo:",
        		long_options, &option_index)) != -1) {
 		switch (c)
 		{
@@ -99,14 +110,6 @@ main(int argc, char **argv)
 		        else if (STREQ(long_options[option_index].name, 
 			    "no_ikconfig")) 
 				kt->flags |= NO_IKCONFIG;
-
-		        else if (STREQ(long_options[option_index].name, 
-			    "no_namelist_gzip")) 
-				pc->flags |= NAMELIST_NO_GZIP;
-
-		        else if (STREQ(long_options[option_index].name, 
-			    "data_debug")) 
-				pc->flags |= DATADEBUG;
 
 		        else if (STREQ(long_options[option_index].name, 
 			    "no_data_debug")) 
@@ -155,10 +158,6 @@ main(int argc, char **argv)
 				clean_exit(0);
 			}
 
-		        else if (STREQ(long_options[option_index].name, 
-			    "shadow_page_tables")) 
-				kt->xen_flags |= SHADOW_PAGE_TABLES;
-
 		        else if (STREQ(long_options[option_index].name, "cpus")) 
 				kt->cpus_override = optarg;
 
@@ -174,8 +173,20 @@ main(int argc, char **argv)
 		        else if (STREQ(long_options[option_index].name, "zero_excluded")) 
 				*diskdump_flags |= ZERO_EXCLUDED;
 
+			else if (STREQ(long_options[option_index].name, "no_elf_notes")) {
+				if (machine_type("X86") || machine_type("X86_64"))
+					*diskdump_flags |= NO_ELF_NOTES;
+				else
+					error(INFO,
+					      "--no_elf_notes is only applicable to "
+					      "the X86 and X86_64 architectures.\n");
+			}
+
 		        else if (STREQ(long_options[option_index].name, "no_panic")) 
 				tt->flags |= PANIC_TASK_NOT_FOUND;
+
+		        else if (STREQ(long_options[option_index].name, "no_strip")) 
+				st->flags |= NO_STRIP;
 
 		        else if (STREQ(long_options[option_index].name, "more")) {
 				if ((pc->scroll_command != SCROLL_NONE) &&
@@ -207,17 +218,68 @@ main(int argc, char **argv)
 		        else if (STREQ(long_options[option_index].name, "mod"))
 				kt->module_tree = optarg;
 
-		        else if (STREQ(long_options[option_index].name, "reloc")) {
+		        else if (STREQ(long_options[option_index].name, "hash")) {
+				if (!calculate(optarg, &pc->nr_hash_queues, NULL, 0)) {
+					error(INFO, "invalid --hash argument: %s\n",
+						optarg);
+				}
+			} else if (STREQ(long_options[option_index].name, "kaslr")) {
+				if (!machine_type("X86_64"))
+					error(INFO, "--kaslr only valid "
+						"with X86_64 machine type.\n");
+				else if (STREQ(optarg, "auto"))
+					kt->flags2 |= (RELOC_AUTO|KASLR);
+				else {
+					if (!calculate(optarg, &kt->relocate,
+							NULL, 0)) {
+						error(INFO,
+						    "invalid --kaslr argument: %s\n",
+						    optarg);
+						program_usage(SHORT_FORM);
+					}
+					kt->relocate *= -1;
+					kt->flags |= RELOC_SET;
+					kt->flags2 |= KASLR;
+				}
+
+			} else if (STREQ(long_options[option_index].name, "reloc")) {
 				if (!calculate(optarg, &kt->relocate, NULL, 0)) {
 					error(INFO, "invalid --reloc argument: %s\n",
 						optarg);
 					program_usage(SHORT_FORM);
-				} 
+				}
 				kt->flags |= RELOC_SET;
 			}
 
 			else if (STREQ(long_options[option_index].name, "minimal")) 
 				pc->flags |= MINIMAL_MODE;
+
+		        else if (STREQ(long_options[option_index].name, "kvmhost"))
+				set_kvmhost_type(optarg);
+
+		        else if (STREQ(long_options[option_index].name, "kvmio"))
+				set_kvm_iohole(optarg);
+
+		        else if (STREQ(long_options[option_index].name, "osrelease")) {
+				pc->flags2 |= GET_OSRELEASE;
+				get_osrelease(optarg);
+			}
+
+		        else if (STREQ(long_options[option_index].name, "log")) {
+				pc->flags2 |= GET_LOG;
+				get_log(optarg);
+			}
+
+			else if (STREQ(long_options[option_index].name, "hex")) {
+				pc->flags2 |= RADIX_OVERRIDE;
+				pc->output_radix = 16;
+			}
+
+			else if (STREQ(long_options[option_index].name, "dec")) {
+				pc->flags2 |= RADIX_OVERRIDE;
+				pc->output_radix = 10;
+			}
+			
 
 			else {
 				error(INFO, "internal error: option %s unhandled\n",
@@ -325,6 +387,10 @@ main(int argc, char **argv)
 			pc->flags |= PRELOAD_EXTENSIONS;
 			break;
 
+		case 'o':
+			ramdump_elf_output_file(optarg);
+			break;
+
 		default:
 			error(INFO, "invalid option: %s\n",
 				argv[optind-1]);
@@ -340,13 +406,42 @@ main(int argc, char **argv)
 	 */
 	while (argv[optind]) {
 
+		if (is_ramdump(argv[optind])) {
+			if (pc->flags & MEMORY_SOURCES) {
+				error(INFO,
+					"too many dumpfile arguments\n");
+					program_usage(SHORT_FORM);
+			}
+			pc->dumpfile = ramdump_to_elf();
+			if (is_kdump(pc->dumpfile, KDUMP_LOCAL)) {
+				pc->flags |= KDUMP;
+				if (is_ramdump_image())
+					pc->readmem = read_ramdump;
+				else
+					pc->readmem = read_kdump;
+				pc->writemem = NULL;
+			} else {
+				error(INFO, "malformed ELF file: %s\n",
+					pc->dumpfile);
+				program_usage(SHORT_FORM);
+			}
+			optind++;
+			continue;
+		}
+
 		if (is_remote_daemon(argv[optind])) {
                 	if (pc->flags & DUMPFILE_TYPES) {
 				error(INFO, 
 				      "too many dumpfile/memory arguments\n");
 				program_usage(SHORT_FORM);
 			}
-			pc->flags |= REMOTE_DAEMON;
+			pc->flags2 |= REMOTE_DAEMON;
+			optind++;
+			continue;
+		}
+
+		if (STREQ(argv[optind], "/dev/crash")) {
+			pc->memory_device = argv[optind];
 			optind++;
 			continue;
 		}
@@ -367,7 +462,29 @@ main(int argc, char **argv)
 			} else
 				pc->namelist = argv[optind];
 
+		} else if (is_compressed_kernel(argv[optind], &tmpname)) {
+			if (pc->namelist) {
+				if (!select_namelist(tmpname)) {
+					error(INFO, 
+					    "too many namelist arguments\n");
+					program_usage(SHORT_FORM);
+				}
+				if (pc->namelist_debug == tmpname) {
+					pc->namelist_debug_orig = argv[optind];
+				} else {
+					pc->namelist_debug_orig = pc->namelist_orig;
+					pc->namelist_orig = argv[optind];
+				}
+			} else {
+				pc->namelist = tmpname;
+				pc->namelist_orig = argv[optind];
+			}
+			pc->cleanup = NULL;
+
 		} else if (!(pc->flags & KERNEL_DEBUG_QUERY)) {
+
+			if (is_flattened_format(argv[optind]))
+				pc->flags2 |= FLAT;
 
 			if (STREQ(argv[optind], "/dev/mem")) {
                         	if (pc->flags & MEMORY_SOURCES) {
@@ -379,6 +496,18 @@ main(int argc, char **argv)
 				pc->dumpfile = NULL;
 				pc->readmem = read_dev_mem;
 				pc->writemem = write_dev_mem;
+				pc->live_memsrc = argv[optind];
+
+			} else if (is_proc_kcore(argv[optind], KCORE_LOCAL)) {
+				if (pc->flags & MEMORY_SOURCES) {
+					error(INFO, 
+					    "too many dumpfile arguments\n");
+					program_usage(SHORT_FORM);
+				}
+				pc->flags |= PROC_KCORE;
+				pc->dumpfile = NULL;
+				pc->readmem = read_proc_kcore;
+				pc->writemem = write_proc_kcore;
 				pc->live_memsrc = argv[optind];
 
 			} else if (is_netdump(argv[optind], NETDUMP_LOCAL)) {
@@ -488,6 +617,18 @@ main(int argc, char **argv)
                                 pc->readmem = read_s390_dumpfile;
                                 pc->writemem = write_s390_dumpfile;
 
+			} else if (is_sadump(argv[optind])) {
+				if ((pc->flags & MEMORY_SOURCES) &&
+				    !sadump_is_diskset()) {
+                                        error(INFO,
+                                            "too many dumpfile arguments\n");
+                                        program_usage(SHORT_FORM);
+				}
+				pc->flags |= SADUMP;
+				pc->dumpfile = argv[optind];
+				pc->readmem = read_sadump;
+				pc->writemem = write_sadump;
+
 			} else { 
 				error(INFO, 
 				    "%s: not a supported file format\n",
@@ -537,9 +678,18 @@ main(int argc, char **argv)
 void
 main_loop(void)
 {
+	if (pc->flags2 & ERASEINFO_DATA)
+		error(WARNING, "\n%s:\n         "
+		    "Kernel data has been erased from this dumpfile.  This may "
+		    "cause\n         the crash session to fail entirely, may "
+                    "cause commands to fail,\n         or may result in "
+		    "unpredictable runtime behavior.\n",
+			pc->dumpfile);
+
         if (!(pc->flags & GDB_INIT)) {
 		gdb_session_init();
 		show_untrusted_files();
+		kdump_backup_region_init();
 		if (XEN_HYPER_MODE()) {
 #ifdef XEN_HYPERVISOR_ARCH
 			machdep_init(POST_GDB);
@@ -586,7 +736,7 @@ main_loop(void)
 
 	if (pc->flags & MINIMAL_MODE)
             error(NOTE, 
-		"minimal mode commands: log, dis, rd, sym, eval, set and exit\n\n");
+		"minimal mode commands: log, dis, rd, sym, eval, set, extend and exit\n\n");
 
         pc->flags |= RUNTIME;
 
@@ -624,6 +774,13 @@ void
 exec_command(void)
 {
 	struct command_table_entry *ct;
+	struct args_input_file args_ifile;
+
+        if (args[0] && (args[0][0] == '\\') && args[0][1]) {
+		shift_string_left(args[0], 1);
+                shift_string_left(pc->orig_line, 1);
+		pc->curcmd_flags |= NO_MODIFY;
+	}
 
 reattempt:
 	if (!args[0])
@@ -643,13 +800,19 @@ reattempt:
 			} else if (!(pc->flags & MINIMAL_MODE)) {
 				tt->refresh_task_table();
 				sort_context_array();
+				sort_tgid_array();	
 			}
 		}
                 if (!STREQ(pc->curcmd, pc->program_name))
                         pc->lastcmd = pc->curcmd;
                 pc->curcmd = ct->name;
 		pc->cmdgencur++;
-                (*ct->func)();
+
+		if (is_args_input_file(ct, &args_ifile))
+			exec_args_input_file(ct, &args_ifile);
+		else
+			(*ct->func)();
+
                 pc->lastcmd = pc->curcmd;
                 pc->curcmd = pc->program_name;
                 return;
@@ -667,6 +830,9 @@ reattempt:
         if (is_datatype_command()) 
                 goto reattempt;
 
+	if (STRNEQ(args[0], "#") || STRNEQ(args[0], "//"))
+		return;
+
 	if (!(pc->flags & MINIMAL_MODE) &&
 	    is_gdb_command(TRUE, FAULT_ON_ERROR)) 
 		goto reattempt;
@@ -679,7 +845,7 @@ reattempt:
 	if (pc->flags & MINIMAL_MODE)
 		error(INFO, 
 		    "%s: command not available in minimal mode\n"
-		    "NOTE: minimal mode commands: log, dis, rd, sym, eval, set and exit\n",
+		    "NOTE: minimal mode commands: log, dis, rd, sym, eval, set, extend and exit\n",
 			args[0]);
 	else
 		error(INFO, "command not found: %s\n", args[0]);
@@ -695,21 +861,40 @@ reattempt:
 struct command_table_entry *
 get_command_table_entry(char *name)
 {       
+	int i;
         struct command_table_entry *cp;
         struct extension_table *ext;
+
+	if (pc->flags2 & GDB_CMD_MODE) {
+		if (STREQ(name, "crash")) {
+			if (argcnt == 1)
+				error(FATAL, 
+				    "a crash command must follow "
+				    "the \"crash\" directive\n");
+			for (i = 1; i <= argcnt; i++)
+				args[i-1] = args[i];
+			argcnt--;
+			name = args[0];
+		} else
+			name = "gdb";
+	}
 	
-	if ((pc->flags & MINIMAL_MODE) && !minimal_functions(name)) 
-		return NULL;
-  
 	for (cp = pc->cmd_table; cp->name; cp++) {
-                if (STREQ(cp->name, name))
-                        return cp;
+                if (STREQ(cp->name, name)) {
+			if (!(pc->flags & MINIMAL_MODE) || (cp->flags & MINIMAL))
+				return cp;
+			else
+				return NULL;
+		}
         }
                 
         for (ext = extension_table; ext; ext = ext->next) {
                 for (cp = ext->command_table; cp->name; cp++) {
                         if (STREQ(cp->name, name)) {
-                                return cp;
+				if (!(pc->flags & MINIMAL_MODE) || (cp->flags & MINIMAL))
+					return cp;
+				else
+					return NULL;
 			}
                 }
         }       
@@ -856,10 +1041,18 @@ setup_environment(int argc, char **argv)
 	pc->memory_device = MEMORY_DRIVER_DEVICE;
 	machdep->bits = sizeof(long) * 8;
 	machdep->verify_paddr = generic_verify_paddr;
+	machdep->get_kvaddr_ranges = generic_get_kvaddr_ranges;
 	pc->redhat_debug_loc = DEFAULT_REDHAT_DEBUG_LOCATION;
 	pc->cmdgencur = 0;
 	pc->cmd_table = linux_command_table;
 	kt->BUG_bytes = -1;
+	kt->flags |= PRE_KERNEL_INIT;
+
+	/*
+	 *  Set up to perform a clean_exit() upon parent death.
+	 */
+	SIGACTION(SIGUSR2, restart, &pc->sigaction, NULL);
+	prctl(PR_SET_PDEATHSIG, SIGUSR2);
 
 	/*
 	 *  Get gdb version before initializing it since this might be one 
@@ -967,6 +1160,7 @@ dump_program_context(void)
 {
 	int i;
 	int others = 0;
+	char *p1;
 	char buf[BUFSIZE];
 	char buf2[BUFSIZE];
 
@@ -1013,9 +1207,6 @@ dump_program_context(void)
                 sprintf(&buf[strlen(buf)], "%sDROP_CORE", others++ ? "|" : "");
         if (pc->flags & LKCD)
                 sprintf(&buf[strlen(buf)], "%sLKCD", others++ ? "|" : "");
-        if (pc->flags & REMOTE_DAEMON)
-                sprintf(&buf[strlen(buf)], "%sREMOTE_DAEMON", 
-			others++ ? "|" : "");
         if (pc->flags & GDB_INIT)
                 sprintf(&buf[strlen(buf)], "%sGDB_INIT", others++ ? "|" : "");
         if (pc->flags & IN_GDB)
@@ -1093,6 +1284,9 @@ dump_program_context(void)
         if (pc->flags & KDUMP)
                 sprintf(&buf[strlen(buf)],
                         "%sKDUMP", others++ ? "|" : "");
+        if (pc->flags & SADUMP)
+                sprintf(&buf[strlen(buf)],
+                        "%sSADUMP", others++ ? "|" : "");
         if (pc->flags & SYSRQ)
                 sprintf(&buf[strlen(buf)],
                         "%sSYSRQ", others++ ? "|" : "");
@@ -1147,6 +1341,9 @@ dump_program_context(void)
         if (pc->flags & PRELOAD_EXTENSIONS)
                 sprintf(&buf[strlen(buf)], 
 			"%sPRELOAD_EXTENSIONS", others++ ? "|" : "");
+        if (pc->flags & PROC_KCORE)
+                sprintf(&buf[strlen(buf)], 
+			"%sPROC_KCORE", others++ ? "|" : "");
 
 	if (pc->flags)
 		strcat(buf, ")");
@@ -1172,12 +1369,40 @@ dump_program_context(void)
 			fprintf(fp, "%s\n", buf);
 	}
 
+	others = 0;
+	fprintf(fp, "           flags2: %llx (", pc->flags2);
+	if (pc->flags2 & FLAT)
+		fprintf(fp, "%sFLAT", others++ ? "|" : "");
+	if (pc->flags2 & ELF_NOTES)
+		fprintf(fp, "%sELF_NOTES", others++ ? "|" : "");
+	if (pc->flags2 & GET_OSRELEASE)
+		fprintf(fp, "%sGET_OSRELEASE", others++ ? "|" : "");
+	if (pc->flags2 & REMOTE_DAEMON)
+		fprintf(fp, "%sREMOTE_DAEMON", others++ ? "|" : "");
+	if (pc->flags2 & LIVE_DUMP)
+		fprintf(fp, "%sLIVE_DUMP", others++ ? "|" : "");
+	if (pc->flags2 & RADIX_OVERRIDE)
+		fprintf(fp, "%sRADIX_OVERRIDE", others++ ? "|" : "");
+	if (pc->flags2 & QEMU_MEM_DUMP)
+		fprintf(fp, "%sQEMU_MEM_DUMP", others++ ? "|" : "");
+	if (pc->flags2 & GET_LOG)
+		fprintf(fp, "%sGET_LOG", others++ ? "|" : "");
+	if (pc->flags2 & VMCOREINFO)
+		fprintf(fp, "%sVMCOREINFO", others++ ? "|" : "");
+	if (pc->flags2 & ALLOW_FP)
+		fprintf(fp, "%sALLOW_FP", others++ ? "|" : "");
+	if (pc->flags2 & RAMDUMP)
+		fprintf(fp, "%sRAMDUMP", others++ ? "|" : "");
+	fprintf(fp, ")\n");
+
 	fprintf(fp, "         namelist: %s\n", pc->namelist);
 	fprintf(fp, "         dumpfile: %s\n", pc->dumpfile);
 	fprintf(fp, "      live_memsrc: %s\n", pc->live_memsrc);
 	fprintf(fp, "       system_map: %s\n", pc->system_map);
 	fprintf(fp, "   namelist_debug: %s\n", pc->namelist_debug);
 	fprintf(fp, "   debuginfo_file: %s\n", pc->debuginfo_file);
+	fprintf(fp, "    namelist_orig: %s\n", pc->namelist_orig);
+	fprintf(fp, "namelist_dbg_orig: %s\n", pc->namelist_debug_orig);
 	fprintf(fp, "  kvmdump_mapfile: %s\n", pc->kvmdump_mapfile);
 	fprintf(fp, "    memory_module: %s\n", pc->memory_module);
 	fprintf(fp, "    memory_device: %s\n", pc->memory_device);
@@ -1210,6 +1435,7 @@ dump_program_context(void)
 	fprintf(fp, "            ofile: %lx\n", (ulong)pc->ofile);
 	fprintf(fp, "       ifile_pipe: %lx\n", (ulong)pc->ifile_pipe);
 	fprintf(fp, "      ifile_ofile: %lx\n", (ulong)pc->ifile_ofile);
+	fprintf(fp, "       args_ifile: %lx\n", (ulong)pc->args_ifile);
 	fprintf(fp, "       input_file: %s\n", pc->input_file);
 	fprintf(fp, "ifile_in_progress: %lx (", pc->ifile_in_progress);
 	others = 0;
@@ -1344,12 +1570,22 @@ dump_program_context(void)
 		fprintf(fp, "%sUD2A_INSTRUCTION", others ? "|" : "");
         if (pc->curcmd_flags & IRQ_IN_USE)
 		fprintf(fp, "%sIRQ_IN_USE", others ? "|" : "");
-        if (pc->curcmd_flags & MODULE_TREE)
-		fprintf(fp, "%sMODULE_TREE", others ? "|" : "");
         if (pc->curcmd_flags & IGNORE_ERRORS)
 		fprintf(fp, "%sIGNORE_ERRORS", others ? "|" : "");
+        if (pc->curcmd_flags & FROM_RCFILE)
+		fprintf(fp, "%sFROM_RCFILE", others ? "|" : "");
+        if (pc->curcmd_flags & MEMTYPE_KVADDR)
+		fprintf(fp, "%sMEMTYPE_KVADDR", others ? "|" : "");
+        if (pc->curcmd_flags & NO_MODIFY)
+		fprintf(fp, "%sNO_MODIFY", others ? "|" : "");
+        if (pc->curcmd_flags & MOD_SECTIONS)
+		fprintf(fp, "%sMOD_SECTIONS", others ? "|" : "");
+        if (pc->curcmd_flags & MOD_READNOW)
+		fprintf(fp, "%sMOD_READNOW", others ? "|" : "");
 	fprintf(fp, ")\n");
 	fprintf(fp, "   curcmd_private: %llx\n", pc->curcmd_private); 
+	fprintf(fp, "      cmd_cleanup: %lx\n", (ulong)pc->cmd_cleanup);
+	fprintf(fp, "  cmd_cleanup_arg: %lx\n", (ulong)pc->cmd_cleanup_arg);
 	fprintf(fp, "       sigint_cnt: %d\n", pc->sigint_cnt);
 	fprintf(fp, "        sigaction: %lx\n", (ulong)&pc->sigaction);
 	fprintf(fp, "    gdb_sigaction: %lx\n", (ulong)&pc->gdb_sigaction);
@@ -1374,53 +1610,96 @@ dump_program_context(void)
 	fprintf(fp, "             rmfd: %d\n", pc->rmfd);
 	fprintf(fp, "             rkfd: %d\n", pc->rkfd);
 	fprintf(fp, "       rcvbufsize: %ld\n", pc->rcvbufsize);
-	if (pc->readmem == read_dev_mem)
-		fprintf(fp, "          readmem: read_dev_mem()\n");
-	else if (pc->readmem == read_mclx_dumpfile)
-		fprintf(fp, "          readmem: read_mclx_dumpfile()\n");
-	else if (pc->readmem == read_lkcd_dumpfile)
-		fprintf(fp, "          readmem: read_lkcd_dumpfile()\n");
-	else if (pc->readmem == read_daemon)
-		fprintf(fp, "          readmem: read_daemon()\n");
-	else if (pc->readmem == read_netdump)
-		fprintf(fp, "          readmem: read_netdump()\n");
-	else if (pc->readmem == read_xendump)
-		fprintf(fp, "          readmem: read_xendump()\n");
-	else if (pc->readmem == read_kdump)
-		fprintf(fp, "          readmem: read_kdump()\n");
-	else if (pc->readmem == read_memory_device)
-		fprintf(fp, "          readmem: read_memory_device()\n");
-	else if (pc->readmem == read_xendump_hyper)
-		fprintf(fp, "          readmem: read_xendump_hyper()\n");
-	else if (pc->readmem == read_diskdump)
-		fprintf(fp, "          readmem: read_diskdump()\n");
+
+	fprintf(fp, "          readmem: ");
+	if ((p1 = readmem_function_name()))
+		fprintf(fp, "%s()\n", p1);
 	else
-		fprintf(fp, "          readmem: %lx\n", (ulong)pc->readmem);
-        if (pc->writemem == write_dev_mem)
-                fprintf(fp, "         writemem: write_dev_mem()\n");
-        else if (pc->writemem == write_mclx_dumpfile)
-                fprintf(fp, "         writemem: write_mclx_dumpfile()\n");
-        else if (pc->writemem == write_lkcd_dumpfile)
-                fprintf(fp, "         writemem: write_lkcd_dumpfile()\n");
-        else if (pc->writemem == write_daemon)
-                fprintf(fp, "         writemem: write_daemon()\n");
-        else if (pc->writemem == write_netdump)
-                fprintf(fp, "         writemem: write_netdump()\n");
-        else if (pc->writemem == write_xendump)
-                fprintf(fp, "         writemem: write_xendump()\n");
-        else if (pc->writemem == write_kdump)
-                fprintf(fp, "         writemem: write_kdump()\n");
-        else if (pc->writemem == write_memory_device)
-                fprintf(fp, "         writemem: write_memory_device()\n");
-        else if (pc->writemem == write_diskdump)
-                fprintf(fp, "         writemem: write_diskdump()\n");
-        else
-                fprintf(fp, "         writemem: %lx\n", (ulong)pc->writemem);
+		fprintf(fp, "%lx\n", (ulong)pc->readmem);
+
+	fprintf(fp, "         writemem: ");
+	if ((p1 = writemem_function_name()))
+		fprintf(fp, "%s()\n", p1);
+	else
+		fprintf(fp, "%lx\n", (ulong)pc->writemem);
 
 	fprintf(fp, "  dumpfile memory: %d\n", 
 		dumpfile_memory(DUMPFILE_MEM_USED)); 
 	fprintf(fp, "           curext: %lx\n", (ulong)pc->curext); 
 	fprintf(fp, "             sbrk: %lx\n", (ulong)pc->sbrk); 
+	fprintf(fp, "          cleanup: %s\n", pc->cleanup);
+	fprintf(fp, "            scope: %lx %s\n", pc->scope,
+		pc->scope ? "" : "(not set)");
+	fprintf(fp, "   nr_hash_queues: %ld\n", pc->nr_hash_queues);
+	fprintf(fp, "  read_vmcoreinfo: %lx\n", (ulong)pc->read_vmcoreinfo);
+}
+
+char *
+readmem_function_name(void)
+{
+	if (pc->readmem == read_dev_mem)
+		return("read_dev_mem");
+	else if (pc->readmem == read_mclx_dumpfile)
+		return("read_mclx_dumpfile");
+	else if (pc->readmem == read_lkcd_dumpfile)
+		return("read_lkcd_dumpfile");
+	else if (pc->readmem == read_daemon)
+		return("read_daemon");
+	else if (pc->readmem == read_netdump)
+		return("read_netdump");
+	else if (pc->readmem == read_xendump)
+		return("read_xendump");
+	else if (pc->readmem == read_kdump)
+		return("read_kdump");
+	else if (pc->readmem == read_memory_device)
+		return("read_memory_device");
+	else if (pc->readmem == read_xendump_hyper)
+		return("read_xendump_hyper");
+	else if (pc->readmem == read_diskdump)
+		return("read_diskdump");
+	else if (pc->readmem == read_proc_kcore)
+		return("read_proc_kcore");
+	else if (pc->readmem == read_sadump)
+		return("read_sadump");
+	else if (pc->readmem == read_s390_dumpfile)
+		return("read_s390_dumpfile");
+	else if (pc->readmem == read_ramdump)
+		return("read_ramdump");
+	else
+		return NULL;
+}
+
+char *
+writemem_function_name(void)
+{
+	if (pc->writemem == write_dev_mem)
+		return("write_dev_mem");
+	else if (pc->writemem == write_mclx_dumpfile)
+		return("write_mclx_dumpfile");
+	else if (pc->writemem == write_lkcd_dumpfile)
+		return("write_lkcd_dumpfile");
+	else if (pc->writemem == write_daemon)
+		return("write_daemon");
+	else if (pc->writemem == write_netdump)
+		return("write_netdump");
+	else if (pc->writemem == write_xendump)
+		return("write_xendump");
+	else if (pc->writemem == write_kdump)
+		return("write_kdump");
+	else if (pc->writemem == write_memory_device)
+		return("write_memory_device");
+//	else if (pc->writemem == write_xendump_hyper)
+//		return("write_xendump_hyper");
+	else if (pc->writemem == write_diskdump)
+		return("write_diskdump");
+	else if (pc->writemem == write_proc_kcore)
+		return("write_proc_kcore");
+	else if (pc->writemem == write_sadump)
+		return("write_sadump");
+	else if (pc->writemem == write_s390_dumpfile)
+		return("write_s390_dumpfile");
+	else
+		return NULL;
 }
 
 /*
@@ -1445,6 +1724,14 @@ clean_exit(int status)
 	if (pc->flags & MEMMOD)
 		cleanup_memory_driver();
 
+	if ((pc->namelist_orig) && file_exists(pc->namelist, NULL))
+		unlink(pc->namelist);
+	if ((pc->namelist_debug_orig) && file_exists(pc->namelist_debug, NULL))
+		unlink(pc->namelist_debug);
+	if (pc->cleanup && file_exists(pc->cleanup, NULL))
+		unlink(pc->cleanup);
+
+	ramdump_cleanup();
 	exit(status);
 }
 
@@ -1514,4 +1801,53 @@ show_untrusted_files(void)
 	}
 	if (cnt)
 		fprintf(fp, "\n");
+}
+
+/*
+ *  If GET_OSRELEASE is still set, the OS release has been
+ *  found and displayed.
+ */
+static void
+get_osrelease(char *dumpfile)
+{
+	int retval = 1;
+
+	if (is_flattened_format(dumpfile))
+		pc->flags2 |= FLAT;
+	
+	if (is_diskdump(dumpfile)) {
+		if (pc->flags2 & GET_OSRELEASE)
+			retval = 0;
+	} else if (is_kdump(dumpfile, KDUMP_LOCAL)) {
+		if (pc->flags2 & GET_OSRELEASE)
+			retval = 0;
+	}
+	
+	if (retval)
+		fprintf(fp, "unknown\n");
+
+	clean_exit(retval);
+}
+
+static void
+get_log(char *dumpfile)
+{
+
+	int retval = 1;
+
+	if (is_flattened_format(dumpfile))
+		pc->flags2 |= FLAT;
+	
+	if (is_diskdump(dumpfile)) {
+		if (pc->flags2 & GET_LOG)
+			retval = 0;
+	} else if (is_kdump(dumpfile, KDUMP_LOCAL)) {
+		if (pc->flags2 & GET_LOG)
+			retval = 0;
+	}
+
+	if (retval)
+		fprintf(fp, "%s: no VMCOREINFO data\n", dumpfile);
+
+	clean_exit(retval);
 }

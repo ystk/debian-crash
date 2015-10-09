@@ -1,8 +1,8 @@
 /* net.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2013 David Anderson
+ * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -151,9 +151,21 @@ net_init(void)
         	MEMBER_OFFSET_INIT(neighbour_dev, "neighbour", "dev");
         	MEMBER_OFFSET_INIT(neighbour_nud_state,  
 			"neighbour", "nud_state");
-		MEMBER_OFFSET_INIT(neigh_table_hash_buckets, 
-			"neigh_table", "hash_buckets");
-		MEMBER_OFFSET_INIT(neigh_table_key_len, 
+		MEMBER_OFFSET_INIT(neigh_table_nht_ptr, "neigh_table", "nht");
+		if (VALID_MEMBER(neigh_table_nht_ptr)) {
+			MEMBER_OFFSET_INIT(neigh_table_hash_mask,
+				"neigh_hash_table", "hash_mask");
+			MEMBER_OFFSET_INIT(neigh_table_hash_shift,
+				"neigh_hash_table", "hash_shift");
+			MEMBER_OFFSET_INIT(neigh_table_hash_buckets,
+				"neigh_hash_table", "hash_buckets");
+		} else {
+			MEMBER_OFFSET_INIT(neigh_table_hash_buckets,
+				"neigh_table", "hash_buckets");
+			MEMBER_OFFSET_INIT(neigh_table_hash_mask,
+				"neigh_table", "hash_mask");
+		}
+		MEMBER_OFFSET_INIT(neigh_table_key_len,
 			"neigh_table", "key_len");
 
         	MEMBER_OFFSET_INIT(in_device_ifa_list,  
@@ -204,11 +216,38 @@ net_init(void)
 				MEMBER_OFFSET_INIT(inet_opt_num, "inet_opt", "num");
 			} else {	/* inet_opt moved to inet_sock */
 				ASSIGN_OFFSET(inet_sock_inet) = 0;
-				MEMBER_OFFSET_INIT(inet_opt_daddr, "inet_sock", "daddr");
-				MEMBER_OFFSET_INIT(inet_opt_rcv_saddr, "inet_sock", "rcv_saddr");
-				MEMBER_OFFSET_INIT(inet_opt_dport, "inet_sock", "dport");
-				MEMBER_OFFSET_INIT(inet_opt_sport, "inet_sock", "sport");
-				MEMBER_OFFSET_INIT(inet_opt_num, "inet_sock", "num");
+				if (MEMBER_EXISTS("inet_sock", "daddr")) {
+					MEMBER_OFFSET_INIT(inet_opt_daddr, "inet_sock", "daddr");
+					MEMBER_OFFSET_INIT(inet_opt_rcv_saddr, "inet_sock", "rcv_saddr");
+					MEMBER_OFFSET_INIT(inet_opt_dport, "inet_sock", "dport");
+					MEMBER_OFFSET_INIT(inet_opt_sport, "inet_sock", "sport");
+					MEMBER_OFFSET_INIT(inet_opt_num, "inet_sock", "num");
+				} else if (MEMBER_EXISTS("inet_sock", "inet_daddr")) {
+					MEMBER_OFFSET_INIT(inet_opt_daddr, "inet_sock", "inet_daddr");
+					MEMBER_OFFSET_INIT(inet_opt_rcv_saddr, "inet_sock", "inet_rcv_saddr");
+					MEMBER_OFFSET_INIT(inet_opt_dport, "inet_sock", "inet_dport");
+					MEMBER_OFFSET_INIT(inet_opt_sport, "inet_sock", "inet_sport");
+					MEMBER_OFFSET_INIT(inet_opt_num, "inet_sock", "inet_num");
+				} else if ((MEMBER_OFFSET("inet_sock", "sk") == 0) &&
+				    (MEMBER_OFFSET("sock", "__sk_common") == 0)) {
+					MEMBER_OFFSET_INIT(inet_opt_daddr, "sock_common", "skc_daddr");
+					if (INVALID_MEMBER(inet_opt_daddr))
+						ANON_MEMBER_OFFSET_INIT(inet_opt_daddr, "sock_common", 
+							"skc_daddr");
+					MEMBER_OFFSET_INIT(inet_opt_rcv_saddr, "sock_common", "skc_rcv_saddr");
+					if (INVALID_MEMBER(inet_opt_rcv_saddr))
+						ANON_MEMBER_OFFSET_INIT(inet_opt_rcv_saddr, "sock_common",
+							"skc_rcv_saddr");
+					MEMBER_OFFSET_INIT(inet_opt_dport, "inet_sock", "inet_dport");
+					if (INVALID_MEMBER(inet_opt_dport))
+						ANON_MEMBER_OFFSET_INIT(inet_opt_dport, "sock_common", 
+							"skc_dport");
+					MEMBER_OFFSET_INIT(inet_opt_sport, "inet_sock", "inet_sport");
+					MEMBER_OFFSET_INIT(inet_opt_num, "inet_sock", "inet_num");
+					if (INVALID_MEMBER(inet_opt_num))
+						ANON_MEMBER_OFFSET_INIT(inet_opt_num, "sock_common", 
+							"skc_num");
+				}
 			}	
 
 			if (VALID_STRUCT(inet_sock) && 
@@ -254,6 +293,7 @@ net_init(void)
 			MEMBER_OFFSET_INIT(ipv6_pinfo_rcv_saddr, "ipv6_pinfo", "rcv_saddr");
 			MEMBER_OFFSET_INIT(ipv6_pinfo_daddr, "ipv6_pinfo", "daddr");
 			STRUCT_SIZE_INIT(in6_addr, "in6_addr");
+			MEMBER_OFFSET_INIT(socket_alloc_vfs_inode, "socket_alloc", "vfs_inode");
 
 			net->flags |= SOCK_V2;
 		}
@@ -264,9 +304,11 @@ net_init(void)
  * The net command...
  */
 
-#define NETOPTS	  "n:asSR:"
+#define NETOPTS	  "n:asSR:xd"
 #define s_FLAG FOREACH_s_FLAG
 #define S_FLAG FOREACH_S_FLAG
+#define x_FLAG FOREACH_x_FLAG
+#define d_FLAG FOREACH_d_FLAG
 
 #define NET_REF_FOUND             (0x1)
 #define NET_REF_HEXNUM            (0x2)
@@ -316,20 +358,34 @@ cmd_net(void)
 			return;
 
 		case 's':
-			if (sflag)
+			if (sflag & S_FLAG)
 				error(INFO, 
 				    "only one -s or -S option allowed\n");
 			else
-				sflag = s_FLAG;
+				sflag |= s_FLAG;
 		        break;
 
 		case 'S':
-			if (sflag)
+			if (sflag & s_FLAG)
 				error(INFO, 
 				    "only one -s or -S option allowed\n");
 			else
-				sflag = S_FLAG;
+				sflag |= S_FLAG;
             		break;
+
+		case 'x':
+			if (sflag & d_FLAG)
+				error(FATAL,
+					"-d and -x are mutually exclusive\n");
+			sflag |= x_FLAG;
+			break;
+
+		case 'd':
+			if (sflag & x_FLAG)
+				error(FATAL,
+					"-d and -x are mutually exclusive\n");
+			sflag |= d_FLAG;
+			break;
 
 		default:
 			argerrs++;
@@ -401,7 +457,6 @@ show_net_devices_v2(void)
 	struct list_data list_data, *ld;
 	char *net_device_buf;
 	char buf[BUFSIZE];
-	ulong *ndevlist;
 	int ndevcnt, i;
 	long flen;
 
@@ -418,33 +473,30 @@ show_net_devices_v2(void)
 
 	ld =  &list_data;
 	BZERO(ld, sizeof(struct list_data));
+	ld->flags |= LIST_ALLOCATE;
 	get_symbol_data("dev_base_head", sizeof(void *), &ld->start);
 	ld->end = symbol_value("dev_base_head");
 	ld->list_head_offset = OFFSET(net_device_dev_list);
 
-	hq_open();
 	ndevcnt = do_list(ld);
-	ndevlist = (ulong *)GETBUF(ndevcnt * sizeof(ulong));
-	ndevcnt = retrieve_list(ndevlist, ndevcnt);
-	hq_close();
 
 	for (i = 0; i < ndevcnt; ++i) {
-		readmem(ndevlist[i], KVADDR, net_device_buf,
+		readmem(ld->list_ptr[i], KVADDR, net_device_buf,
 			SIZE(net_device), "net_device buffer",
 			FAULT_ON_ERROR);
 
                 fprintf(fp, "%s  ",
 			mkstring(buf, flen, CENTER|RJUST|LONG_HEX,
-			MKSTR(ndevlist[i])));
+			MKSTR(ld->list_ptr[i])));
 
-		get_device_name(ndevlist[i], buf);
+		get_device_name(ld->list_ptr[i], buf);
 		fprintf(fp, "%-6s ", buf);
 
-		get_device_address(ndevlist[i], buf);
+		get_device_address(ld->list_ptr[i], buf);
 		fprintf(fp, "%s\n", buf);
 	}
 	
-	FREEBUF(ndevlist);
+	FREEBUF(ld->list_ptr);
 	FREEBUF(net_device_buf);
 }
 
@@ -454,7 +506,6 @@ show_net_devices_v3(void)
 	struct list_data list_data, *ld;
 	char *net_device_buf;
 	char buf[BUFSIZE];
-	ulong *ndevlist;
 	int ndevcnt, i;
 	long flen;
 
@@ -471,36 +522,33 @@ show_net_devices_v3(void)
 
 	ld =  &list_data;
 	BZERO(ld, sizeof(struct list_data));
+	ld->flags |= LIST_ALLOCATE;
 	ld->start = ld->end =
 		 symbol_value("init_net") + OFFSET(net_dev_base_head);
 	ld->list_head_offset = OFFSET(net_device_dev_list);
 
-	hq_open();
 	ndevcnt = do_list(ld);
-	ndevlist = (ulong *)GETBUF(ndevcnt * sizeof(ulong));
-	ndevcnt = retrieve_list(ndevlist, ndevcnt);
-	hq_close();
 
 	/*
 	 *  Skip the first entry (init_net).
 	 */
 	for (i = 1; i < ndevcnt; ++i) {
-		readmem(ndevlist[i], KVADDR, net_device_buf,
+		readmem(ld->list_ptr[i], KVADDR, net_device_buf,
 			SIZE(net_device), "net_device buffer",
 			FAULT_ON_ERROR);
 
                 fprintf(fp, "%s  ",
 			mkstring(buf, flen, CENTER|RJUST|LONG_HEX,
-			MKSTR(ndevlist[i])));
+			MKSTR(ld->list_ptr[i])));
 
-		get_device_name(ndevlist[i], buf);
+		get_device_name(ld->list_ptr[i], buf);
 		fprintf(fp, "%-6s ", buf);
 
-		get_device_address(ndevlist[i], buf);
+		get_device_address(ld->list_ptr[i], buf);
 		fprintf(fp, "%s\n", buf);
 	}
 	
-	FREEBUF(ndevlist);
+	FREEBUF(ld->list_ptr);
 	FREEBUF(net_device_buf);
 }
 
@@ -508,27 +556,26 @@ show_net_devices_v3(void)
  * Perform the actual work of dumping the ARP table...
  */
 #define ARP_HEADING \
-	"IP ADDRESS      HW TYPE    HW ADDRESS         DEVICE  STATE"
+	"NEIGHBOUR        IP ADDRESS      HW TYPE    HW ADDRESS         DEVICE  STATE"
 
 static void
 dump_arp(void)
 {
 	ulong	arp_tbl;		/* address of arp_tbl */
 	ulong	*hash_buckets;
+	ulong	hash;
 	long	hash_bytes;
-	int	nhash_buckets;
+	int	nhash_buckets = 0;
 	int	key_len;
 	int	i;
 	int	header_printed = 0;
+	int	hash_mask = 0;
+	ulong	nht;
 
 	if (!symbol_exists("arp_tbl")) 
 		error(FATAL, "arp_tbl does not exist in this kernel\n");
 
 	arp_tbl = symbol_value("arp_tbl");
-
-	nhash_buckets = (i = ARRAY_LENGTH(neigh_table_hash_buckets)) ?
-		i : get_array_length("neigh_table.hash_buckets", 
-			NULL, sizeof(void *));
 
 	/*
 	 *  NOTE: 2.6.8 -> 2.6.9 neigh_table struct changed from:
@@ -537,10 +584,41 @@ dump_arp(void)
 	 *  to
 	 *    struct neighbour **hash_buckets;
 	 *
-	 *  Even after hardwiring and testing with the correct
-	 *  array size, other changes cause this command to break
-	 *  down, so it needs to be looked at by someone who cares...
+	 *  Use 'hash_mask' as indicator to decide if we're dealing
+	 *  with an array or a pointer.
+	 *
+	 * Around 2.6.37 neigh_hash_table struct has been introduced
+	 * and pointer to it has been added to neigh_table.
 	 */
+	if (VALID_MEMBER(neigh_table_nht_ptr)) {
+		readmem(arp_tbl + OFFSET(neigh_table_nht_ptr),
+			KVADDR, &nht, sizeof(nht),
+			"neigh_table nht", FAULT_ON_ERROR);
+		/* NB! Re-use of offsets like neigh_table_hash_mask
+		 * with neigh_hash_table structure */
+		if (VALID_MEMBER(neigh_table_hash_mask)) {
+			readmem(nht + OFFSET(neigh_table_hash_mask),
+				KVADDR, &hash_mask, sizeof(hash_mask),
+				"neigh_hash_table hash_mask", FAULT_ON_ERROR);
+
+			nhash_buckets = hash_mask + 1;
+		} else if (VALID_MEMBER(neigh_table_hash_shift)) {
+			readmem(nht + OFFSET(neigh_table_hash_shift),
+				KVADDR, &hash_mask, sizeof(hash_mask),
+				"neigh_hash_table hash_shift", FAULT_ON_ERROR);
+
+			nhash_buckets = 1U << hash_mask;
+		}
+	} else if (VALID_MEMBER(neigh_table_hash_mask)) {
+		readmem(arp_tbl + OFFSET(neigh_table_hash_mask),
+			KVADDR, &hash_mask, sizeof(hash_mask),
+			"neigh_table hash_mask", FAULT_ON_ERROR);
+
+		nhash_buckets = hash_mask + 1;
+	} else
+		nhash_buckets = (i = ARRAY_LENGTH(neigh_table_hash_buckets)) ?
+			i : get_array_length("neigh_table.hash_buckets", 
+				NULL, sizeof(void *));
 
 	if (nhash_buckets == 0) {
 		option_not_supported('a');
@@ -555,9 +633,25 @@ dump_arp(void)
 		KVADDR, &key_len, sizeof(key_len),
 		"neigh_table key_len", FAULT_ON_ERROR);
 
-	readmem(arp_tbl + OFFSET(neigh_table_hash_buckets), 
-		KVADDR, hash_buckets, hash_bytes,
-		"neigh_table hash_buckets", FAULT_ON_ERROR);
+	if (VALID_MEMBER(neigh_table_nht_ptr)) {
+		readmem(nht + OFFSET(neigh_table_hash_buckets),
+			KVADDR, &hash, sizeof(hash),
+			"neigh_hash_table hash_buckets ptr", FAULT_ON_ERROR);
+
+		readmem(hash, KVADDR, hash_buckets, hash_bytes,
+			"neigh_hash_table hash_buckets", FAULT_ON_ERROR);
+	} else if (hash_mask) {
+		readmem(arp_tbl + OFFSET(neigh_table_hash_buckets), 
+			KVADDR, &hash, sizeof(hash),
+			"neigh_table hash_buckets pointer", FAULT_ON_ERROR);
+		
+		readmem(hash,
+			KVADDR, hash_buckets, hash_bytes,
+			"neigh_table hash_buckets", FAULT_ON_ERROR);
+	} else
+		readmem(arp_tbl + OFFSET(neigh_table_hash_buckets), 
+			KVADDR, hash_buckets, hash_bytes,
+			"neigh_table hash_buckets", FAULT_ON_ERROR);
 
 	for (i = 0; i < nhash_buckets; i++) {
 		if (hash_buckets[i] != (ulong)NULL) {
@@ -611,7 +705,7 @@ print_neighbour_q(ulong addr, int key_len)
 			FAULT_ON_ERROR);
 
 		in_addr.s_addr = ipaddr;
-		fprintf(fp, "%-16s", inet_ntoa(in_addr));
+		fprintf(fp, "%-16lx %-16s", addr, inet_ntoa(in_addr));
 
 		switch (dinfo.dev_type) {
 		case ARPHRD_ETHER:
@@ -670,7 +764,6 @@ print_neighbour_q(ulong addr, int key_len)
 		}
 
 		fprintf(fp, " %-6s  ", dinfo.dev_name);
-		fprintf(fp, "%02x ", state);
 
 		arp_state_to_flags(state);
 
@@ -778,7 +871,8 @@ get_sock_info(ulong sock, char *buf)
 {
 	uint32_t daddr, rcv_saddr;
 	uint16_t dport, sport;
-	ushort num, family, type;
+	ushort family, type;
+	ushort num ATTRIBUTE_UNUSED;
 	char *sockbuf, *inet_sockbuf;
 	ulong ipv6_pinfo, ipv6_rcv_saddr, ipv6_daddr;
 	uint16_t u6_addr16_src[8];
@@ -1024,7 +1118,7 @@ do {									\
 		if (blen != 0) {					\
 			sprintf(bp, "|%s", (s));			\
 		} else {						\
-			sprintf(bp, "(%s", (s));			\
+			sprintf(bp, "%s", (s));				\
 		}							\
 	}								\
 } while(0)
@@ -1087,7 +1181,7 @@ arp_state_to_flags(unsigned char state)
 	}
 
 	if (had_flags) {
-		fprintf(fp, "%s)\n", flag_buffer);
+		fprintf(fp, "%s\n", flag_buffer);
 		/* fprintf(fp, "%29.29s%s)\n", " ",  flag_buffer); */
 	}
 }
@@ -1383,9 +1477,17 @@ sym_socket_dump(ulong file,
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
 	char *socket_hdr = BITS32() ? socket_hdr_32 : socket_hdr_64;
+	unsigned int radix;
 
 	file_buf = fill_file_cache(file);
 	dentry = ULONG(file_buf + OFFSET(file_f_dentry));
+
+	if (flag & d_FLAG)
+		radix = 10;
+	else if (flag & x_FLAG)
+		radix = 16;
+	else
+		radix = 0;
 
     	if (!dentry)
         	return FALSE;
@@ -1432,7 +1534,7 @@ sym_socket_dump(ulong file,
 		if (!VALID_SIZE(inet_sock)) 
 			error(FATAL, 
               	           "cannot determine what an inet_sock structure is\n");
-    		struct_socket = inode - SIZE(socket);
+    		struct_socket = inode - OFFSET(socket_alloc_vfs_inode);
 		socket_buf = GETBUF(SIZE(socket));
                 readmem(struct_socket, KVADDR, socket_buf,
                         SIZE(socket), "socket buffer", FAULT_ON_ERROR);
@@ -1482,17 +1584,17 @@ sym_socket_dump(ulong file,
 			mkstring(buf2, VADDR_PRLEN, RJUST|LONG_HEX, 
 			MKSTR(sock)));
 
-    		dump_struct("socket", struct_socket, 0);
+    		dump_struct("socket", struct_socket, radix);
 		switch (net->flags & (SOCK_V1|SOCK_V2))  
 		{
 		case SOCK_V1:
-    			dump_struct("sock", sock, 0);
+    			dump_struct("sock", sock, radix);
 			break;
 		case SOCK_V2:
 			if (STRUCT_EXISTS("inet_sock") && !(net->flags & NO_INET_SOCK))
-				dump_struct("inet_sock", sock, 0);
+				dump_struct("inet_sock", sock, radix);
 			else if (STRUCT_EXISTS("sock"))
-				dump_struct("sock", sock, 0);
+				dump_struct("sock", sock, radix);
 			else
 				fprintf(fp, "\nunable to display inet_sock structure\n");
 			break;

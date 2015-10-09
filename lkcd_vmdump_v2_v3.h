@@ -35,7 +35,7 @@
 #include <asm/vmdump.h>                 /* for architecture-specific header */
 #endif
 
-#if defined(X86) || defined(PPC) || defined(S390) || defined(S390X)
+#if defined(ARM) || defined(X86) || defined(PPC) || defined(S390) || defined(S390X) || defined(ARM64)
 
 /*
  * Kernel header file for Linux crash dumps.
@@ -84,7 +84,9 @@ typedef struct _dump_header_asm_s {
 	/* the dump registers */
 #ifndef S390
 #ifndef S390X
+#ifndef ARM64
 	struct pt_regs       dha_regs;
+#endif
 #endif
 #endif
 
@@ -92,7 +94,7 @@ typedef struct _dump_header_asm_s {
 
 #endif /* _ASM_VMDUMP_H */
 
-#endif /* X86 || PPC */
+#endif /* ARM || X86 || PPC */
 
 #if defined(ALPHA) || defined(IA64) || defined(X86_64) || defined(PPC64)
 

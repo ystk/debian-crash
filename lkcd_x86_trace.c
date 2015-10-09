@@ -5,8 +5,8 @@
 /* 
  *  lkcd_x86_trace.c
  *
- *  Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
- *  Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+ *  Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012 David Anderson
+ *  Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012 Red Hat, Inc. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -65,7 +65,7 @@ static int find_trace(kaddr_t, kaddr_t, kaddr_t, kaddr_t, trace_t *, int);
 static void dump_stack_frame(trace_t *, sframe_t *, FILE *);
 static void print_trace(trace_t *, int, FILE *);
 static int eframe_type(uaddr_t *);
-char *funcname_display(char *);
+static char *funcname_display(char *, ulong, struct bt_info *, char *);
 static void print_eframe(FILE *, uaddr_t *);
 static void trace_banner(FILE *);
 static void print_kaddr(kaddr_t, FILE *, int);
@@ -1352,6 +1352,64 @@ eframe_incr(kaddr_t addr, char *funcname)
 	return val;
 }
 
+static int 
+xen_top_of_stack(struct bt_info *bt, char *funcname)
+{
+	ulong stkptr, contents;
+
+	for (stkptr = bt->stacktop-4; stkptr > bt->stackbase; stkptr--) {
+		contents = GET_STACK_ULONG(stkptr);
+		if (kl_funcname(contents) == funcname)
+			return TRUE;
+		if (valid_ra(contents))
+			break;
+	}
+
+	return FALSE;
+}
+
+static char *
+xen_funcname(struct bt_info *bt, ulong pc) 
+{
+	char *funcname = kl_funcname(pc);
+
+	if (xen_top_of_stack(bt, funcname) &&
+	    (pc >= symbol_value("hypercall")) &&
+	    (pc < symbol_value("ret_from_intr")))
+		return "hypercall";
+
+	return funcname;
+}
+
+static int
+userspace_return(kaddr_t frame, struct bt_info *bt)
+{
+	ulong esp0, eframe_addr; 
+	uint32_t *stkptr, *eframeptr;
+	
+	if (INVALID_MEMBER(task_struct_thread) ||
+	    (((esp0 = MEMBER_OFFSET("thread_struct", "esp0")) < 0) &&
+             ((esp0 = MEMBER_OFFSET("thread_struct", "sp0")) < 0)))
+		eframe_addr = bt->stacktop - SIZE(pt_regs);
+	else
+		eframe_addr = ULONG(tt->task_struct + 
+			OFFSET(task_struct_thread) + esp0) - SIZE(pt_regs);
+
+	if (!INSTACK(eframe_addr, bt))
+		return FALSE;
+
+	stkptr = (uint32_t *)(bt->stackbuf + ((ulong)frame - bt->stackbase));
+	eframeptr = (uint32_t *)(bt->stackbuf + (eframe_addr - bt->stackbase));
+
+	while (stkptr < eframeptr) {
+		if (is_kernel_text_offset(*stkptr))
+			return FALSE;
+		stkptr++;
+	}
+
+	return TRUE;
+}
+
 /*
  * find_trace()
  *
@@ -1474,15 +1532,20 @@ find_trace(
 
 #ifdef REDHAT
 		if (XEN_HYPER_MODE()) {
-			func_name = kl_funcname(pc);
+			func_name = xen_funcname(bt, pc);
 			if (STREQ(func_name, "idle_loop") || STREQ(func_name, "hypercall")
 				|| STREQ(func_name, "process_softirqs")
 				|| STREQ(func_name, "tracing_off")
 				|| STREQ(func_name, "page_fault")
-				|| STREQ(func_name, "handle_exception")) {
+				|| STREQ(func_name, "handle_exception")
+				|| xen_top_of_stack(bt, func_name)) {
 				UPDATE_FRAME(func_name, pc, 0, sp, bp, asp, 0, 0, bp - sp, 0);
 				return(trace->nframes);
 			}
+		} else if (STREQ(closest_symbol(pc), "cpu_idle")) {
+			func_name = kl_funcname(pc);
+			UPDATE_FRAME(func_name, pc, 0, sp, bp, asp, 0, 0, bp - sp, 0);
+			return(trace->nframes);
 		}
 
 		ra = GET_STACK_ULONG(bp + 4);
@@ -1572,6 +1635,8 @@ find_trace(
 							flag = EX_FRAME|SET_EX_FRAME_ADDR;
 						else if (STREQ(closest_symbol(pc), "ret_from_fork"))
 							flag = EX_FRAME|SET_EX_FRAME_ADDR;
+						else if (userspace_return(bp, bt))
+							flag = EX_FRAME|SET_EX_FRAME_ADDR;
 						else {
 							curframe->error = KLE_BAD_RA;
 							flag = 0;
@@ -1644,6 +1709,14 @@ find_trace(
 				UPDATE_FRAME(func_name, pc, 
 					ra, sp, bp, asp, 0, 0, 0, 0);
 				return(trace->nframes);
+			} else if (STREQ(func_name, "ret_from_fork")) {
+				ra = 0;
+				bp = sp = saddr - 4;
+				asp = curframe->asp;
+				curframe = alloc_sframe(trace, flags);
+				UPDATE_FRAME(func_name, pc, 
+					ra, sp, bp, asp, 0, 0, 0, EX_FRAME|SET_EX_FRAME_ADDR);
+				return(trace->nframes);
 #ifdef REDHAT
                         } else if (STREQ(func_name, "cpu_idle")) {
                                 ra = 0;
@@ -1714,9 +1787,11 @@ find_trace(
 				} else {
 					return(trace->nframes);
 				}
-			} else if (strstr(func_name, "call_do_IRQ") ||
+			} else if (is_task_active(bt->task) && 
+				(strstr(func_name, "call_do_IRQ") ||
 				strstr(func_name, "common_interrupt") ||
-				strstr(func_name, "call_function_interrupt")) {
+				strstr(func_name, "reboot_interrupt") ||
+				strstr(func_name, "call_function_interrupt"))) {
 				/* Interrupt frame */
 				sp = curframe->fp + 4;
 				asp = (uaddr_t*)((uaddr_t)sbp + (STACK_SIZE - 
@@ -1809,8 +1884,13 @@ find_trace(
 static int 
 kernel_entry_from_user_space(sframe_t *curframe, struct bt_info *bt)
 {
+	if (is_kernel_thread(bt->tc->task))
+		return FALSE;
+
 	if (((curframe->fp + 4 + SIZE(pt_regs)) == GET_STACKTOP(bt->task)) &&
 	    !is_kernel_thread(bt->tc->task))
+		return TRUE;
+	else if (userspace_return(curframe->fp+4, bt))
 		return TRUE;
 	else
 		return FALSE;
@@ -1915,7 +1995,8 @@ print_trace(trace_t *trace, int flags, FILE *ofp)
 	sframe_t *frmp;
 #ifdef REDHAT
 	kaddr_t fp = 0;
-	kaddr_t last_fp, last_pc, next_fp, next_pc;
+	kaddr_t last_fp ATTRIBUTE_UNUSED;
+	kaddr_t last_pc, next_fp, next_pc;
 	struct bt_info *bt;
 
 	bt = trace->bt;
@@ -2429,9 +2510,12 @@ recoverable(struct bt_info *bt, FILE *ofp)
 		}
 	}
 
-	if (!gather_text_list(bt) || !(bt->flags & BT_ERROR_MASK) ||
-            !STREQ(kl_funcname(bt->instptr), "schedule"))
-		return FALSE;
+	if (!gather_text_list(bt) || 
+	    !STREQ(kl_funcname(bt->instptr), "schedule"))
+		return FALSE; 
+
+	if (!is_idle_thread(bt->task) && !(bt->flags & BT_ERROR_MASK))
+		return FALSE; 
 
         esp = eip = 0;
 	calls_schedule = FALSE;
@@ -2579,31 +2663,36 @@ static void
 print_stack_entry(struct bt_info *bt, int level, ulong esp, ulong eip, 
 		  char *funcname, sframe_t *frmp, FILE *ofp)
 {
-	char buf[BUFSIZE];
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
 	struct syment *sp;
+	struct load_module *lm;
 
 	if (frmp && frmp->prev && STREQ(frmp->funcname, "error_code") &&
 	    (sp = x86_jmp_error_code((ulong)frmp->prev->pc)))
-		sprintf(buf, " (via %s)", sp->name);
+		sprintf(buf1, " (via %s)", sp->name);
 	else if (frmp && (STREQ(frmp->funcname, "stext_lock") ||
 		STRNEQ(frmp->funcname, ".text.lock")) &&
                 (sp = x86_text_lock_jmp(eip, NULL)))
-		sprintf(buf, " (via %s)", sp->name);
+		sprintf(buf1, " (via %s)", sp->name);
 	else
-		buf[0] = NULLCHAR;
+		buf1[0] = NULLCHAR;
 
 	if ((sp = eframe_label(funcname, eip))) 
 		funcname = sp->name;
 
-	fprintf(ofp, "%s#%d [%8lx] %s%s at %lx\n",
+	fprintf(ofp, "%s#%d [%8lx] %s%s at %lx",
                 level < 10 ? " " : "", level, esp, 
-		funcname_display(funcname), 
-		strlen(buf) ? buf : "", eip);
+		funcname_display(funcname, eip, bt, buf2), 
+		strlen(buf1) ? buf1 : "", eip);
+	if (module_symbol(eip, NULL, &lm, NULL, 0))
+		fprintf(ofp, " [%s]", lm->mod_name);
+	fprintf(ofp, "\n");
 
         if (bt->flags & BT_LINE_NUMBERS) {
-                get_line_number(eip, buf, FALSE);
-                if (strlen(buf))
-                	fprintf(ofp, "    %s\n", buf);
+                get_line_number(eip, buf1, FALSE);
+                if (strlen(buf1))
+                	fprintf(ofp, "    %s\n", buf1);
         }
 }
 
@@ -2663,7 +2752,7 @@ eframe_label(char *funcname, ulong eip)
 		    (efp->sysenter = symbol_search("ia32_sysenter_target"))) {
                 	if ((sp = symbol_search("sysexit_ret_end_marker")))
                         	efp->sysenter_end = sp;
-			else if (THIS_KERNEL_VERSION >= LINUX(2,6,33)) {
+			else if (THIS_KERNEL_VERSION >= LINUX(2,6,32)) {
 				if ((sp = symbol_search("sysexit_audit")) ||
 				    (sp = symbol_search("sysenter_exit")))
                         		efp->sysenter_end = 
@@ -2743,10 +2832,17 @@ eframe_label(char *funcname, ulong eip)
  *  this routine won't cause the passed-in function name pointer
  *  to be changed -- this is strictly for display purposes only.
  */
-char *
-funcname_display(char *funcname)
+static char *
+funcname_display(char *funcname, ulong eip, struct bt_info *bt, char *buf)
 {
 	struct syment *sp;
+	ulong offset;
+
+	if (bt->flags & BT_SYMBOL_OFFSET) {
+		sp = value_search(eip, &offset);
+		if (sp && offset)
+			return value_to_symstr(eip, buf, bt->radix);
+	}
 
         if (STREQ(funcname, "nmi_stack_correct") &&
             (sp = symbol_search("nmi"))) 
@@ -4539,7 +4635,8 @@ op_indir_e(int opnum, int opdata, instr_rec_t *irp)
 static void
 get_modrm_data16(int opnum, int opdata, instr_rec_t *irp)
 {
-	int reg, mod, mod_rm, reg_op;
+	int mod ATTRIBUTE_UNUSED;
+	int reg, mod_rm, reg_op;
 
 	get_modrm_info(irp->modrm, &mod_rm, &reg_op);
 	mod = irp->modrm >> 6;
@@ -4693,7 +4790,8 @@ get_modrm_data16(int opnum, int opdata, instr_rec_t *irp)
 static void
 get_modrm_data32(int opnum, int opdata, instr_rec_t *irp)
 {
-	int reg, mod, mod_rm, reg_op;
+	int mod ATTRIBUTE_UNUSED;
+	int reg, mod_rm, reg_op;
 
 	get_modrm_info(irp->modrm, &mod_rm, &reg_op);
 	mod = irp->modrm >> 6;
@@ -4803,7 +4901,8 @@ get_modrm_data32(int opnum, int opdata, instr_rec_t *irp)
 		case  4: /* [..][..] (SIB) */
 		case 12: /* disp8[..][..] (SIB) */
 		case 20: { /* disp32[..][..] (SIB) */
-			int s, i, b, mod, rm, havebase;
+			int rm ATTRIBUTE_UNUSED;
+			int s, i, b, mod, havebase;
 
 			s = (irp->sib >> 6) & 3;
 			i = (irp->sib >> 3) & 7;

@@ -42,6 +42,17 @@ xen_hyper_init(void)
 	long member_offset;
 #endif
 
+#ifdef X86_64
+	xht->xen_virt_start = symbol_value("start");
+
+	/*
+	 * Xen virtual mapping is aligned to 1 GiB boundary.
+	 * Image starts no more than 1 GiB below
+	 * beginning of virtual address space.
+	 */
+	xht->xen_virt_start &= 0xffffffffc0000000;
+#endif
+
 	if (machine_type("X86_64") &&
 	    symbol_exists("xen_phys_start") && !xen_phys_start())
 		error(WARNING, 
@@ -57,7 +68,6 @@ xen_hyper_init(void)
 	machdep->get_smp_cpus();
 	machdep->memory_size();
 
-#ifdef IA64
 	if (symbol_exists("__per_cpu_offset")) {
 		xht->flags |= XEN_HYPER_SMP;
 		if((xht->__per_cpu_offset = malloc(sizeof(ulong) * XEN_HYPER_MAX_CPUS())) == NULL) {
@@ -69,7 +79,6 @@ xen_hyper_init(void)
 			error(FATAL, "cannot read __per_cpu_offset.\n");
 		}
 	}
-#endif
 
 #if defined(X86) || defined(X86_64)
 	if (symbol_exists("__per_cpu_shift")) {
@@ -198,6 +207,7 @@ xen_hyper_domain_init(void)
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_domain_flags, "domain", "domain_flags");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_evtchn, "domain", "evtchn");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_hvm, "domain", "is_hvm");
+	XEN_HYPER_MEMBER_OFFSET_INIT(domain_guest_type, "domain", "guest_type");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_privileged, "domain", "is_privileged");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_debugger_attached, "domain", "debugger_attached");
 
@@ -212,6 +222,8 @@ xen_hyper_domain_init(void)
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_shutting_down, "domain", "is_shutting_down");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_shut_down, "domain", "is_shut_down");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_vcpu, "domain", "vcpu");
+	XEN_HYPER_MEMBER_SIZE_INIT(domain_vcpu, "domain", "vcpu");
+	XEN_HYPER_MEMBER_OFFSET_INIT(domain_max_vcpus, "domain", "max_vcpus");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_arch, "domain", "arch");
 
 	XEN_HYPER_STRUCT_SIZE_INIT(arch_shared_info, "arch_shared_info");
@@ -312,6 +324,7 @@ xen_hyper_x86_pcpu_init(void)
 	struct xen_hyper_pcpu_context *pcc;
 	char *buf, *bp;
 	int i, cpuid;
+	int flag;
 
 	XEN_HYPER_MEMBER_OFFSET_INIT(cpu_info_guest_cpu_user_regs, "cpu_info", "guest_cpu_user_regs");
 	XEN_HYPER_MEMBER_OFFSET_INIT(cpu_info_processor_id, "cpu_info", "processor_id");
@@ -323,11 +336,21 @@ xen_hyper_x86_pcpu_init(void)
 
 	/* get physical cpu context */
 	xen_hyper_alloc_pcpu_context_space(XEN_HYPER_MAX_CPUS());
-	init_tss_base = symbol_value("init_tss");
+	if (symbol_exists("per_cpu__init_tss")) {
+		init_tss_base = symbol_value("per_cpu__init_tss");
+		flag = TRUE;
+	} else {
+		init_tss_base = symbol_value("init_tss");
+		flag = FALSE;
+	}
 	buf = GETBUF(XEN_HYPER_SIZE(tss_struct));	
 	for_cpu_indexes(i, cpuid)
 	{
-		init_tss = init_tss_base + XEN_HYPER_SIZE(tss_struct) * cpuid;
+		if (flag)
+			init_tss = xen_hyper_per_cpu(init_tss_base, cpuid);
+		else
+			init_tss = init_tss_base +
+				XEN_HYPER_SIZE(tss_struct) * cpuid;
 		if (!readmem(init_tss, KVADDR, buf,
 			XEN_HYPER_SIZE(tss_struct), "init_tss", RETURN_ON_ERROR)) {
 			error(FATAL, "cannot read init_tss.\n");
@@ -379,7 +402,8 @@ xen_hyper_misc_init(void)
 	XEN_HYPER_STRUCT_SIZE_INIT(schedule_data, "schedule_data");
 	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_schedule_lock, "schedule_data", "schedule_lock");
 	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_curr, "schedule_data", "curr");
-	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_idle, "schedule_data", "idle");
+	if (MEMBER_EXISTS("schedule_data", "idle"))
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_idle, "schedule_data", "idle");
 	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_sched_priv, "schedule_data", "sched_priv");
 	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_s_timer, "schedule_data", "s_timer");
 	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_tick, "schedule_data", "tick");
@@ -426,13 +450,21 @@ xen_hyper_schedule_init(void)
 		error(FATAL, "cannot malloc scheduler struct space.\n");
 	}
 	buf = GETBUF(XEN_HYPER_SCHEDULER_NAME);	
-	opt_sched = symbol_value("opt_sched");
+	scheduler_opt_name = XEN_HYPER_OFFSET(scheduler_opt_name);
+	if (symbol_exists("ops")) {
+		if (!readmem(symbol_value("ops") + scheduler_opt_name, KVADDR,
+			&opt_sched, sizeof(ulong), "ops.opt_name",
+			RETURN_ON_ERROR)) {
+			error(FATAL, "cannot read ops.opt_name.\n");
+		}
+	} else {
+		opt_sched = symbol_value("opt_sched");
+	}
 	if (!readmem(opt_sched, KVADDR, xhscht->opt_sched,
 	XEN_HYPER_OPT_SCHED_SIZE, "opt_sched,", RETURN_ON_ERROR)) {
 		error(FATAL, "cannot read opt_sched,.\n");
 	}
 	schedulers = symbol_value("schedulers");
-	scheduler_opt_name = XEN_HYPER_OFFSET(scheduler_opt_name);
 	addr = schedulers;
 	while (xhscht->name == NULL) {
 		if (!readmem(addr, KVADDR, schedulers_buf,
@@ -513,7 +545,10 @@ xen_hyper_schedule_init(void)
 		}
 		schc->cpu_id = cpuid;
 		schc->curr = ULONG(buf + XEN_HYPER_OFFSET(schedule_data_curr));
-		schc->idle = ULONG(buf + XEN_HYPER_OFFSET(schedule_data_idle));
+		if (MEMBER_EXISTS("schedule_data", "idle"))
+			schc->idle = ULONG(buf + XEN_HYPER_OFFSET(schedule_data_idle));
+		else
+			schc->idle = xht->idle_vcpu_array[cpuid];
 		schc->sched_priv =
 			ULONG(buf + XEN_HYPER_OFFSET(schedule_data_sched_priv));
 		if (XEN_HYPER_VALID_MEMBER(schedule_data_tick))
@@ -605,25 +640,32 @@ xen_hyper_dumpinfo_init(void)
 	}
 
 	/* allocate a context area */
-	size = sizeof(struct xen_hyper_dumpinfo_context) * XEN_HYPER_MAX_CPUS();
+	size = sizeof(struct xen_hyper_dumpinfo_context) * machdep->get_smp_cpus();
 	if((xhdit->context_array = malloc(size)) == NULL) {
 		error(FATAL, "cannot malloc dumpinfo table context space.\n");
 	}
 	BZERO(xhdit->context_array, size);
-	size = sizeof(struct xen_hyper_dumpinfo_context_xen_core) * XEN_HYPER_MAX_CPUS();
+	size = sizeof(struct xen_hyper_dumpinfo_context_xen_core) * machdep->get_smp_cpus();
 	if((xhdit->context_xen_core_array = malloc(size)) == NULL) {
 		error(FATAL, "cannot malloc dumpinfo table context_xen_core_array space.\n");
 	}
 	BZERO(xhdit->context_xen_core_array, size);
-	addr = symbol_value("per_cpu__crash_notes");
-	for (i = 0; i < XEN_HYPER_MAX_CPUS(); i++) {
+	if (symbol_exists("per_cpu__crash_notes"))
+		addr = symbol_value("per_cpu__crash_notes");
+	else
+		get_symbol_data("crash_notes", sizeof(ulong), &addr);
+	for (i = 0; i < machdep->get_smp_cpus(); i++) {
 		ulong addr_notes;
 
-		addr_notes = xen_hyper_per_cpu(addr, i);
+		if (symbol_exists("per_cpu__crash_notes"))
+			addr_notes = xen_hyper_per_cpu(addr, i);
+		else
+			addr_notes = addr + i * STRUCT_SIZE("crash_note_range_t") +
+					MEMBER_OFFSET("crash_note_range_t", "start");
 		if (xhdit->note_ver == XEN_HYPER_ELF_NOTE_V4) {
 			if (!readmem(addr_notes, KVADDR, &(xhdit->context_array[i].note),
-			sizeof(ulong), "per_cpu__crash_notes", RETURN_ON_ERROR)) {
-				error(WARNING, "cannot read per_cpu__crash_notes.\n");
+			sizeof(ulong), "crash_notes", RETURN_ON_ERROR)) {
+				error(WARNING, "cannot read crash_notes.\n");
 				return;
 			}
 		} else {
@@ -648,7 +690,7 @@ xen_hyper_dumpinfo_init(void)
 	xhdit->xen_info_cpu = samp_cpuid;
 	if (!xen_hyper_fill_elf_notes(xhdit->context_array[samp_cpuid].note,
 	buf, XEN_HYPER_ELF_NOTE_FILL_T_NOTE)) {
-		error(FATAL, "cannot read per_cpu__crash_notes.\n");
+		error(FATAL, "cannot read crash_notes.\n");
 	}
 	bp = buf;
 
@@ -1189,7 +1231,9 @@ struct xen_hyper_domain_context *
 xen_hyper_store_domain_context(struct xen_hyper_domain_context *dc,
 	       ulong domain, char *dp)
 {
-	int i;
+	char *vcpup;
+	unsigned int max_vcpus;
+	unsigned int i;
 
 	dc->domain = domain;
 	BCOPY((char *)(dp + XEN_HYPER_OFFSET(domain_domain_id)),
@@ -1204,31 +1248,82 @@ xen_hyper_store_domain_context(struct xen_hyper_domain_context *dc,
 		dc->domain_flags = ULONG(dp + XEN_HYPER_OFFSET(domain_domain_flags));
 	else if (XEN_HYPER_VALID_MEMBER(domain_is_shut_down)) {
 		dc->domain_flags = 0;
-		if (*(dp + XEN_HYPER_OFFSET(domain_is_hvm))) {
+                if (XEN_HYPER_VALID_MEMBER(domain_is_hvm) &&
+                    *(dp + XEN_HYPER_OFFSET(domain_is_hvm))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_HVM;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_privileged))) {
+		}
+                if (XEN_HYPER_VALID_MEMBER(domain_guest_type) &&
+                    *(dp + XEN_HYPER_OFFSET(domain_guest_type))) {
+			/* For now PVH and HVM are the same for crash.
+			 * and 0 is PV.
+			 */
+			dc->domain_flags |= XEN_HYPER_DOMS_HVM;
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_privileged))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_privileged;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_debugger_attached))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_debugger_attached))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_debugging;
-		} else if (XEN_HYPER_VALID_MEMBER(domain_is_polling) &&
+		}
+		if (XEN_HYPER_VALID_MEMBER(domain_is_polling) &&
 				*(dp + XEN_HYPER_OFFSET(domain_is_polling))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_polling;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_paused_by_controller))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_paused_by_controller))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_ctrl_pause;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_dying))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_dying))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_dying;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_shutting_down))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_shutting_down))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_shuttingdown;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_shut_down))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_shut_down))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_shutdown;
 		}
 	} else {
 		dc->domain_flags = XEN_HYPER_DOMF_ERROR;
 	}
 	dc->evtchn = ULONG(dp + XEN_HYPER_OFFSET(domain_evtchn));
-	for (i = 0; i < XEN_HYPER_MAX_VIRT_CPUS; i++) {
-		dc->vcpu[i] = ULONG(dp + XEN_HYPER_OFFSET(domain_vcpu) + i*sizeof(void *));
-		if (dc->vcpu[i])	XEN_HYPER_NR_VCPUS_IN_DOM(dc)++;
+	if (XEN_HYPER_VALID_MEMBER(domain_max_vcpus)) {
+		max_vcpus = UINT(dp + XEN_HYPER_OFFSET(domain_max_vcpus));
+	} else if (XEN_HYPER_VALID_SIZE(domain_vcpu)) {
+		max_vcpus = XEN_HYPER_SIZE(domain_vcpu) / sizeof(void *);
+	} else {
+		max_vcpus = XEN_HYPER_MAX_VIRT_CPUS;
+	}
+	if (!(dc->vcpu = malloc(sizeof(ulong) * max_vcpus))) {
+		error(FATAL, "cannot malloc vcpu array (%d VCPUs).",
+		      max_vcpus);
+	}
+	if (MEMBER_TYPE("domain", "vcpu") == TYPE_CODE_ARRAY)
+		vcpup = dp + XEN_HYPER_OFFSET(domain_vcpu);
+	else {
+		ulong vcpu_array = ULONG(dp + XEN_HYPER_OFFSET(domain_vcpu));
+		if (vcpu_array && max_vcpus) {
+			if (!(vcpup =
+				malloc(max_vcpus * sizeof(void *)))) {
+				error(FATAL, "cannot malloc VCPU array for domain %lx.",
+					domain);
+			}
+			if (!readmem(vcpu_array, KVADDR,
+				vcpup, max_vcpus * sizeof(void*),
+				"VCPU array", RETURN_ON_ERROR)) {
+				error(FATAL, "cannot read VCPU array for domain %lx.",
+					domain);
+			}
+		} else {
+			vcpup = NULL;
+		}
+	}
+	if (vcpup) {
+		for (i = 0; i < max_vcpus; i++) {
+			dc->vcpu[i] = ULONG(vcpup + i*sizeof(void *));
+			if (dc->vcpu[i])	XEN_HYPER_NR_VCPUS_IN_DOM(dc)++;
+		}
+		if (vcpup != dp + XEN_HYPER_OFFSET(domain_vcpu)) {
+			free(vcpup);
+		}
 	}
 
 	return dc;
@@ -1290,6 +1385,13 @@ xen_hyper_alloc_domain_context_space(int domains)
 		}
 		xhdt->context_array_cnt = domains;
 	} else if (domains > xhdt->context_array_cnt) {
+		struct xen_hyper_domain_context *dc;
+		int i;
+		for (dc = xhdt->context_array, i = 0;
+		     i < xhdt->context_array_cnt; ++dc, ++i) {
+			if (dc->vcpu)
+				free(dc->vcpu);
+		}
 		if (!(xhdt->context_array =
 			realloc(xhdt->context_array,
 				domains * sizeof(struct xen_hyper_domain_context)))) {
@@ -1801,27 +1903,39 @@ xen_hyper_get_uptime_hyper(void)
 void
 xen_hyper_get_cpu_info(void)
 {
-	ulong addr;
+	ulong addr, init_begin, init_end;
 	ulong *cpumask;
 	uint *cpu_idx;
 	int i, j, cpus;
 
-	get_symbol_data("max_cpus", sizeof(xht->max_cpus), &xht->max_cpus);
 	XEN_HYPER_STRUCT_SIZE_INIT(cpumask_t, "cpumask_t");
-	if (XEN_HYPER_SIZE(cpumask_t) * 8 > xht->max_cpus) {
-		xht->max_cpus = XEN_HYPER_SIZE(cpumask_t) * 8;
+
+	if (symbol_exists("nr_cpu_ids"))
+		get_symbol_data("nr_cpu_ids", sizeof(uint), &xht->max_cpus);
+	else {
+		init_begin = symbol_value("__init_begin");
+		init_end = symbol_value("__init_end");
+		addr = symbol_value("max_cpus");
+
+		if (addr >= init_begin && addr < init_end)
+			xht->max_cpus = XEN_HYPER_SIZE(cpumask_t) * 8;
+		else {
+			get_symbol_data("max_cpus", sizeof(xht->max_cpus), &xht->max_cpus);
+			if (XEN_HYPER_SIZE(cpumask_t) * 8 > xht->max_cpus)
+				xht->max_cpus = XEN_HYPER_SIZE(cpumask_t) * 8;
+		}
 	}
+
 	if (xht->cpumask) {
 		free(xht->cpumask);
 	}
 	if((xht->cpumask = malloc(XEN_HYPER_SIZE(cpumask_t))) == NULL) {
 		error(FATAL, "cannot malloc cpumask space.\n");
 	}
-	/* kakuma: It may be better to use cpu_present_map. */
-	addr = symbol_value("cpu_online_map");
+	addr = symbol_value("cpu_present_map");
 	if (!readmem(addr, KVADDR, xht->cpumask,
-		XEN_HYPER_SIZE(cpumask_t), "cpu_online_map", RETURN_ON_ERROR)) {
-		error(FATAL, "cannot read cpu_online_map.\n");
+		XEN_HYPER_SIZE(cpumask_t), "cpu_present_map", RETURN_ON_ERROR)) {
+		error(FATAL, "cannot read cpu_present_map.\n");
 	}
 	if (xht->cpu_idxs) {
 		free(xht->cpu_idxs);

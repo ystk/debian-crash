@@ -1,8 +1,8 @@
 /* s390.c - core analysis suite
  *
  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2006, 2009-2010, 2012-2014 David Anderson
+ * Copyright (C) 2002-2006, 2009-2010, 2012-2014 Red Hat, Inc. All rights reserved.
  * Copyright (C) 2005, 2006, 2010 Michael Holzheu, IBM Corporation
  *
  * This program is free software; you can redistribute it and/or modify
@@ -59,7 +59,7 @@ static int s390_eframe_search(struct bt_info *);
 static void s390_back_trace_cmd(struct bt_info *);
 static void s390_dump_irq(int);
 static void s390_get_stack_frame(struct bt_info *, ulong *, ulong *);
-static int s390_dis_filter(ulong, char *);
+static int s390_dis_filter(ulong, char *, unsigned int);
 static void s390_cmd_mach(void);
 static int s390_get_smp_cpus(void);
 static void s390_display_machine_stats(void);
@@ -68,15 +68,24 @@ static struct line_number_hook s390_line_number_hooks[];
 static int s390_is_uvaddr(ulong, struct task_context *);
 
 /*
+ * struct lowcore name (old: "_lowcore", new: "lowcore")
+ */
+static char *lc_struct;
+
+/*
  * Initialize member offsets
  */
 static void s390_offsets_init(void)
 {
-	if (MEMBER_EXISTS("_lowcore", "st_status_fixed_logout"))
-		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, "_lowcore",
+	if (STRUCT_EXISTS("lowcore"))
+		lc_struct = "lowcore";
+	else
+		lc_struct = "_lowcore";
+	if (MEMBER_EXISTS(lc_struct, "st_status_fixed_logout"))
+		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, lc_struct,
 				   "st_status_fixed_logout");
 	else
-		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, "_lowcore",
+		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, lc_struct,
 				   "psw_save_area");
 }
 
@@ -549,7 +558,7 @@ s390_has_cpu(struct bt_info *bt)
 {
 	int cpu = bt->tc->processor;
 
-	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE))
+	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE_MAP))
 		return TRUE;
 	else
 		return FALSE;
@@ -578,9 +587,9 @@ static void s390_get_int_stack(char *stack_name, char* lc, char* int_stack,
 {
 	unsigned long stack_addr;
 
-	if (!MEMBER_EXISTS("_lowcore", stack_name))
+	if (!MEMBER_EXISTS(lc_struct, stack_name))
 		return;
-	stack_addr = ULONG(lc + MEMBER_OFFSET("_lowcore", stack_name));
+	stack_addr = ULONG(lc + MEMBER_OFFSET(lc_struct, stack_name));
 	if (stack_addr == 0)
 		return;
 	readmem(stack_addr - INT_STACK_SIZE, KVADDR, int_stack,
@@ -610,7 +619,7 @@ s390_back_trace_cmd(struct bt_info *bt)
 		error(WARNING,
 		"instruction pointer argument ignored on this architecture!\n");
 	}
-	if (is_task_active(bt->task) && !(kt->cpu_flags[cpu] & ONLINE)) {
+	if (is_task_active(bt->task) && !(kt->cpu_flags[cpu] & ONLINE_MAP)) {
 		fprintf(fp, " CPU offline\n");
 		return;
 	}
@@ -663,7 +672,11 @@ s390_back_trace_cmd(struct bt_info *bt)
 	backchain = ksp;
 	do {
 		unsigned long r14_stack_off;
+		struct load_module *lm;
 		int j;
+		ulong offset;
+		char *name_plus_offset;
+		struct syment *sp;
 
 		/* Find stack: Either async, panic stack or task stack */
 		if((backchain > stack_start) && (backchain < stack_end)){
@@ -697,7 +710,18 @@ s390_back_trace_cmd(struct bt_info *bt)
 			skip_first_frame=0;
 		} else {
 			fprintf(fp," #%i [%08lx] ",i,backchain);
-			fprintf(fp,"%s at %x\n", closest_symbol(r14), r14);
+			name_plus_offset = NULL;
+			if (bt->flags & BT_SYMBOL_OFFSET) {
+				sp = value_search(r14, &offset);
+				if (sp && offset)
+					name_plus_offset = 
+						value_to_symstr(r14, buf, bt->radix);
+			}
+			fprintf(fp,"%s at %x", name_plus_offset ? 
+				name_plus_offset : closest_symbol(r14), r14);
+			if (module_symbol(r14, NULL, &lm, NULL, 0))
+				fprintf(fp, " [%s]", lm->mod_name);
+			fprintf(fp, "\n");
 			if (bt->flags & BT_LINE_NUMBERS)
 				s390_dump_line_number(r14);
 			i++;
@@ -778,18 +802,18 @@ s390_print_lowcore(char* lc, struct bt_info *bt, int show_symbols)
 		if (bt->flags & BT_LINE_NUMBERS)
 	       		s390_dump_line_number(tmp[1] & S390_ADDR_MASK);
 	}	
-	ptr = lc + MEMBER_OFFSET("_lowcore","cpu_timer_save_area");
+	ptr = lc + MEMBER_OFFSET(lc_struct, "cpu_timer_save_area");
 	tmp[0]=UINT(ptr);
 	tmp[1]=UINT(ptr + S390_WORD_SIZE);
 	fprintf(fp,"  -cpu timer: %#010lx %#010lx\n", tmp[0],tmp[1]);
 
-	ptr = lc + MEMBER_OFFSET("_lowcore","clock_comp_save_area");
+	ptr = lc + MEMBER_OFFSET(lc_struct, "clock_comp_save_area");
 	tmp[0]=UINT(ptr);
 	tmp[1]=UINT(ptr + S390_WORD_SIZE);
 	fprintf(fp,"  -clock cmp: %#010lx %#010lx\n", tmp[0], tmp[1]);
 
 	fprintf(fp,"  -general registers:\n");
-	ptr = lc + MEMBER_OFFSET("_lowcore","gpregs_save_area");
+	ptr = lc + MEMBER_OFFSET(lc_struct, "gpregs_save_area");
 	tmp[0]=ULONG(ptr);
 	tmp[1]=ULONG(ptr + S390_WORD_SIZE);
 	tmp[2]=ULONG(ptr + 2 * S390_WORD_SIZE);
@@ -816,7 +840,7 @@ s390_print_lowcore(char* lc, struct bt_info *bt, int show_symbols)
 		tmp[0], tmp[1], tmp[2], tmp[3]);
 
 	fprintf(fp,"  -access registers:\n");
-	ptr = lc + MEMBER_OFFSET("_lowcore","access_regs_save_area");
+	ptr = lc + MEMBER_OFFSET(lc_struct, "access_regs_save_area");
 	tmp[0]=ULONG(ptr);
 	tmp[1]=ULONG(ptr + S390_WORD_SIZE);
 	tmp[2]=ULONG(ptr + 2 * S390_WORD_SIZE);
@@ -843,7 +867,7 @@ s390_print_lowcore(char* lc, struct bt_info *bt, int show_symbols)
 		tmp[0], tmp[1], tmp[2], tmp[3]);
 
 	fprintf(fp,"  -control registers:\n");
-	ptr = lc + MEMBER_OFFSET("_lowcore","cregs_save_area");
+	ptr = lc + MEMBER_OFFSET(lc_struct, "cregs_save_area");
 	tmp[0]=ULONG(ptr);
 	tmp[1]=ULONG(ptr + S390_WORD_SIZE);
 	tmp[2]=ULONG(ptr + 2 * S390_WORD_SIZE);
@@ -857,20 +881,20 @@ s390_print_lowcore(char* lc, struct bt_info *bt, int show_symbols)
 	fprintf(fp,"     %#010lx %#010lx %#010lx %#010lx\n", 
 		tmp[0], tmp[1], tmp[2], tmp[3]);
 
-	tmp[0]=ULONG(ptr);
-	tmp[1]=ULONG(ptr + S390_WORD_SIZE);
-	tmp[2]=ULONG(ptr + 2 * S390_WORD_SIZE);
-	tmp[3]=ULONG(ptr + 3 * S390_WORD_SIZE);
+	tmp[0]=ULONG(ptr + 8 * S390_WORD_SIZE);
+	tmp[1]=ULONG(ptr + 9 * S390_WORD_SIZE);
+	tmp[2]=ULONG(ptr + 10 * S390_WORD_SIZE);
+	tmp[3]=ULONG(ptr + 11 * S390_WORD_SIZE);
 	fprintf(fp,"     %#010lx %#010lx %#010lx %#010lx\n", 
 		tmp[0], tmp[1], tmp[2], tmp[3]);
-	tmp[0]=ULONG(ptr + 4 * S390_WORD_SIZE);
-	tmp[1]=ULONG(ptr + 5 * S390_WORD_SIZE);
-	tmp[2]=ULONG(ptr + 6 * S390_WORD_SIZE);
-	tmp[3]=ULONG(ptr + 7 * S390_WORD_SIZE);
+	tmp[0]=ULONG(ptr + 12 * S390_WORD_SIZE);
+	tmp[1]=ULONG(ptr + 13 * S390_WORD_SIZE);
+	tmp[2]=ULONG(ptr + 14 * S390_WORD_SIZE);
+	tmp[3]=ULONG(ptr + 15 * S390_WORD_SIZE);
 	fprintf(fp,"     %#010lx %#010lx %#010lx %#010lx\n", 
 		tmp[0], tmp[1], tmp[2], tmp[3]);
 
-	ptr = lc + MEMBER_OFFSET("_lowcore","floating_pt_save_area");
+	ptr = lc + MEMBER_OFFSET(lc_struct, "floating_pt_save_area");
 	fprintf(fp,"  -floating point registers 0,2,4,6:\n");
 	tmp[0]=ULONG(ptr);
 	tmp[1]=ULONG(ptr + 2 * S390_WORD_SIZE);
@@ -896,7 +920,7 @@ s390_get_stack_frame(struct bt_info *bt, ulong *eip, ulong *esp)
 	/* get the stack pointer */
 	if(esp){
 		if(s390_has_cpu(bt)){
-			ksp = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+			ksp = ULONG(lowcore + MEMBER_OFFSET(lc_struct,
 				"gpregs_save_area") + (15 * S390_WORD_SIZE));
 		} else {
 			readmem(bt->task + OFFSET(task_struct_thread_ksp),
@@ -942,7 +966,7 @@ s390_dump_irq(int irq)
  *  Filter disassembly output if the output radix is not gdb's default 10
  */
 static int 
-s390_dis_filter(ulong vaddr, char *inbuf)
+s390_dis_filter(ulong vaddr, char *inbuf, unsigned int output_radix)
 {
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
@@ -964,7 +988,7 @@ s390_dis_filter(ulong vaddr, char *inbuf)
 
 	if (colon) {
 		sprintf(buf1, "0x%lx <%s>", vaddr,
-			value_to_symstr(vaddr, buf2, pc->output_radix));
+			value_to_symstr(vaddr, buf2, output_radix));
 		sprintf(buf2, "%s%s", buf1, colon);
 		strcpy(inbuf, buf2);
 	}
@@ -986,9 +1010,9 @@ s390_dis_filter(ulong vaddr, char *inbuf)
 			return FALSE;
 
 		sprintf(buf1, "0x%lx <%s>\n", value,
-			value_to_symstr(value, buf2, pc->output_radix));
+			value_to_symstr(value, buf2, output_radix));
 
-		sprintf(p1, buf1);
+		sprintf(p1, "%s", buf1);
 	}
 
 	console("    %s", inbuf);

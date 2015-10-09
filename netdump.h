@@ -71,6 +71,13 @@ struct vmcore_data {
 	struct xen_kdump_data *xen_kdump_data;
 	void *vmcoreinfo;
 	uint size_vmcoreinfo;
+/* Backup Region, first 640K of System RAM. */
+#define KEXEC_BACKUP_SRC_END	0x0009ffff
+	uint num_qemu_notes;
+	void *nt_qemu_percpu[NR_CPUS];
+	ulonglong backup_src_start;
+	ulong backup_src_size;
+	ulonglong backup_offset;
 };
 
 /*
@@ -124,3 +131,73 @@ struct xen_kdump_data {
 #define KDUMP_MFN_LIST  (0x4)
 
 #define P2M_FAILURE ((physaddr_t)(0xffffffffffffffffLL))
+
+/*
+ * S390 CPU timer ELF note
+ */
+#ifndef NT_S390_TIMER
+#define NT_S390_TIMER 0x301
+#endif
+
+/*
+ * S390 TOD clock comparator ELF note
+ */
+#ifndef NT_S390_TODCMP
+#define NT_S390_TODCMP 0x302
+#endif
+
+/*
+ * S390 TOD programmable register ELF note
+ */
+#ifndef NT_S390_TODPREG
+#define NT_S390_TODPREG 0x303
+#endif
+
+/*
+ * S390 control registers ELF note
+ */
+#ifndef NT_S390_CTRS
+#define NT_S390_CTRS 0x304
+#endif
+
+/*
+ * S390 prefix ELF note
+ */
+#ifndef NT_S390_PREFIX
+#define NT_S390_PREFIX 0x305
+#endif
+
+#define MAX_KCORE_ELF_HEADER_SIZE (32768)
+
+struct proc_kcore_data {
+	uint flags;
+	uint segments;
+	char *elf_header;
+        Elf64_Ehdr *elf64;
+	Elf64_Phdr *load64;
+        Elf32_Ehdr *elf32;
+	Elf32_Phdr *load32;
+};
+
+struct QEMUCPUSegment {
+    uint32_t selector;
+    uint32_t limit;
+    uint32_t flags;
+    uint32_t pad;
+    uint64_t base;
+};
+
+typedef struct QEMUCPUSegment QEMUCPUSegment;
+
+struct QEMUCPUState {
+    uint32_t version;
+    uint32_t size;
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip, rflags;
+    QEMUCPUSegment cs, ds, es, fs, gs, ss;
+    QEMUCPUSegment ldt, tr, gdt, idt;
+    uint64_t cr[5];
+};
+
+typedef struct QEMUCPUState QEMUCPUState;
