@@ -496,7 +496,7 @@ static int processCFI(const u8 *start,
 /* Unwind to previous to frame.  Returns 0 if successful, negative
  * number in case of an error. */
 int 
-unwind(struct unwind_frame_info *frame)
+unwind(struct unwind_frame_info *frame, int is_ehframe)
 {
 #define FRAME_REG(r, t) (((t *)frame)[reg_info[r].offs])
 	const u32 *fde = NULL, *cie = NULL;
@@ -527,17 +527,22 @@ unwind(struct unwind_frame_info *frame)
 		     fde += 1 + *fde / sizeof(*fde)) {
 			if (!*fde || (*fde & (sizeof(*fde) - 1)))
 				break;
-			if (!fde[1])
+			if (is_ehframe && !fde[1])
+				continue; /* this is a CIE */
+			else if (fde[1] == 0xffffffff)
 				continue; /* this is a CIE */
 			if ((fde[1] & (sizeof(*fde) - 1))
 			    || fde[1] > (unsigned long)(fde + 1)
 			                - (unsigned long)unwind_table)
 				continue; /* this is not a valid FDE */
-			cie = fde + 1 - fde[1] / sizeof(*fde);
+			if (is_ehframe)
+				cie = fde + 1 - fde[1] / sizeof(*fde);
+			else
+				cie = unwind_table + fde[1];
 			if (*cie <= sizeof(*cie) + 4
 			    || *cie >= fde[1] - sizeof(*fde)
 			    || (*cie & (sizeof(*cie) - 1))
-			    || cie[1]
+			    || (cie[1] != 0xffffffff && cie[1])
 			    || (ptrType = fde_pointer_type(cie)) < 0) {
 				cie = NULL; /* this is not a (valid) CIE */
 				continue;
@@ -783,10 +788,13 @@ init_unwind_table(void)
 
 try_eh_frame:
 
-	if (st->dwarf_eh_frame_size) {
+	if (st->dwarf_eh_frame_size || st->dwarf_debug_frame_size) {
 		int fd;
+		int is_ehframe = (!st->dwarf_debug_frame_size &&
+				   st->dwarf_eh_frame_size);
 
-		unwind_table_size = st->dwarf_eh_frame_size;
+		unwind_table_size = is_ehframe ? st->dwarf_eh_frame_size :
+						 st->dwarf_debug_frame_size;
 
 		if (!(unwind_table = malloc(unwind_table_size))) {
 			error(WARNING, "cannot malloc unwind table space\n");
@@ -794,18 +802,22 @@ try_eh_frame:
 		}
 
 		if ((fd = open(pc->namelist, O_RDONLY)) < 0) {
-			error(WARNING, "cannot open %s for .eh_frame data\n",
-				pc->namelist);
+			error(WARNING, "cannot open %s for %s data\n",
+				pc->namelist, is_ehframe ? ".eh_frame" : ".debug_frame");
 			free(unwind_table);
 			return;
 		}
 
-		lseek(fd, st->dwarf_eh_frame_file_offset, SEEK_SET);
+		if (is_ehframe)
+			lseek(fd, st->dwarf_eh_frame_file_offset, SEEK_SET);
+		else
+			lseek(fd, st->dwarf_debug_frame_file_offset, SEEK_SET);
 
-		if (read(fd, unwind_table, st->dwarf_eh_frame_size) !=
-		    st->dwarf_eh_frame_size) {
-			error(WARNING, "cannot read .eh_frame data from %s\n",
-				pc->namelist);
+		if (read(fd, unwind_table, unwind_table_size) !=
+		    unwind_table_size) {
+			if (CRASHDEBUG(1))
+				error(WARNING, "cannot read %s data from %s\n",
+			        	is_ehframe ? ".eh_frame" : ".debug_frame", pc->namelist);
 			free(unwind_table);
 			return;
 		}
@@ -916,11 +928,16 @@ populate_local_tables(ulong root, char *buf)
         BZERO(ld, sizeof(struct list_data));
         ld->start = root;
         ld->member_offset = OFFSET(unwind_table_link);
+	ld->flags = RETURN_ON_LIST_ERROR;
 	if (CRASHDEBUG(1))
         	ld->flags |= VERBOSE;
 
 	hq_open();
         cnt = do_list(ld);
+	if (cnt == -1) {
+		error(WARNING, "UNWIND: failed to gather unwind_table list");
+		return 0;
+	}
         table_list = (ulong *)GETBUF(cnt * sizeof(ulong));
 	cnt = retrieve_list(table_list, cnt);
 	hq_close();
@@ -1054,6 +1071,7 @@ dwarf_backtrace(struct bt_info *bt, int level, ulong stacktop)
 	struct syment *sp;
 	char *name;
 	struct unwind_frame_info *frame;
+	int is_ehframe = (!st->dwarf_debug_frame_size && st->dwarf_eh_frame_size);
 
 	frame = (struct unwind_frame_info *)GETBUF(sizeof(struct unwind_frame_info));
 //	frame->regs.rsp = bt->stkptr;
@@ -1102,7 +1120,7 @@ dwarf_backtrace(struct bt_info *bt, int level, ulong stacktop)
 			UNW_PC(frame), frame->regs.rbp);
 
        	while ((UNW_SP(frame) < stacktop)
-				&& !unwind(frame) && UNW_PC(frame)) {
+				&& !unwind(frame, is_ehframe) && UNW_PC(frame)) {
 		/* To prevent rip pushed on IRQ stack being reported both
 		 * both on the IRQ and process stacks
 		 */
@@ -1193,6 +1211,7 @@ dwarf_debug(struct bt_info *bt)
 {
 	struct unwind_frame_info *frame;
 	ulong bp;
+	int is_ehframe = (!st->dwarf_debug_frame_size && st->dwarf_eh_frame_size);
 
 	if (!bt->hp->eip) {
 		dump_local_unwind_tables();
@@ -1220,7 +1239,7 @@ dwarf_debug(struct bt_info *bt)
  		sizeof(unsigned long), "reading bp", FAULT_ON_ERROR);
         frame->regs.rbp = bp;  /* fixme for x86 */
 
-	unwind(frame);
+	unwind(frame, is_ehframe);
 
 	fprintf(fp, "frame size: %lx (%lx)\n", 
 		(ulong)UNW_SP(frame), (ulong)UNW_SP(frame) - bt->hp->esp);

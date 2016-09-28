@@ -3,8 +3,8 @@
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
  * Copyright (C) 2002 Silicon Graphics, Inc. 
  * Copyright (C) 2002 Free Software Foundation, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2007 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2007 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2005, 2007, 2009, 2011, 2013 David Anderson
+ * Copyright (C) 2002-2005, 2007, 2009, 2011, 2013 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -261,9 +261,6 @@ void
 dump_lkcd_environment(ulong arg)
 {
 	int others;
-	FILE *fp;
-
-	fp = lkcd->fp;
 
 	if (arg == LKCD_DUMP_HEADER_ONLY)
 		goto dump_header_only;
@@ -621,32 +618,6 @@ lkcd_memory_dump(FILE *fp)
 
 }
 
-static void
-lkcd_speedo(void)
-{
-        static int i = 0;
-
-        if (pc->flags & SILENT) {
-                return;
-        }
-
-        switch (++i%4) {
-        case 0:
-                lkcd_print("|\b");
-                break;
-        case 1:
-                lkcd_print("\\\b");
-                break;
-        case 2:
-                lkcd_print("-\b");
-                break;
-        case 3:
-                lkcd_print("/\b");
-                break;
-        }
-	fflush(stdout);
-}
-
 
 /*
  *  The lkcd_lseek() routine does the bulk of the work setting things up 
@@ -709,7 +680,7 @@ retry:
 		if (lkcd->zones[ii].start == zone) {
 			if (lkcd->zones[ii].pages[page].offset != 0) {
 			   if (lkcd->zones[ii].pages[page].offset != off) {
-				if (CRASHDEBUG(1))
+				if (CRASHDEBUG(1) && !STREQ(pc->curcmd, "search"))
 				    error(INFO, "LKCD: conflicting page: zone %lld, "
 					"page %lld: %lld, %lld != %lld\n",
 					(unsigned long long)zone, 
@@ -814,7 +785,6 @@ lkcd_get_kernel_start(ulong *addr)
 int
 lkcd_lseek(physaddr_t paddr)
 {
-        long i = 0;
 	int err;
         int eof;
         void *dp;
@@ -859,10 +829,6 @@ lkcd_lseek(physaddr_t paddr)
     lseek(lkcd->fd, lkcd->page_offset_max, SEEK_SET);
     eof = FALSE;
     while (!eof) {
-	if( (i++%2048) == 0) {
-	    lkcd_speedo();
-	}
-
 	switch (lkcd_load_dump_page_header(dp, page))
 	{
 	    case LKCD_DUMPFILE_OK:
@@ -1064,7 +1030,7 @@ cache_page(void)
 	ulong type;
 	int found, newsz;
 	uint32_t rawsz;
-	ssize_t bytes;
+	ssize_t bytes ATTRIBUTE_UNUSED;
 
 
         for (i = found = 0; i < LKCD_CACHED_PAGES; i++) {
@@ -1274,9 +1240,10 @@ lkcd_uncompress_gzip(unsigned char *dest, ulong destlen,
 	switch (uncompress(dest, &retlen, source, sourcelen)) 
 	{
 	case Z_OK:
-		if (retlen == destlen)
+		if (retlen == destlen) {
                         rc = TRUE;
                         break;
+		}
 
 		lkcd_print("uncompress: returned length not page size: %ld\n",
 				retlen);
@@ -1328,7 +1295,7 @@ lkcd_print(char *fmt, ...)
         va_end(ap);
 
 	if (lkcd->fp)
-		fprintf(lkcd->fp, buf);
+		fprintf(lkcd->fp, "%s", buf);
 	else
 		console(buf);
 }

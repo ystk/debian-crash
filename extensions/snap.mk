@@ -1,6 +1,6 @@
 #
-# Copyright (C) 2009 David Anderson
-# Copyright (C) 2009 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2009, 2011, 2013 David Anderson
+# Copyright (C) 2009, 2011, 2013 Red Hat, Inc. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,6 +18,10 @@ ifeq ($(shell arch), i686)
   TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64
 endif
 ifeq ($(shell arch), ppc64)
+  TARGET=PPC64
+  TARGET_CFLAGS=-m64
+endif
+ifeq ($(shell arch), ppc64le)
   TARGET=PPC64
   TARGET_CFLAGS=-m64
 endif
@@ -43,4 +47,4 @@ endif
 all: snap.so
 	
 snap.so: $(INCDIR)/defs.h snap.c 
-	gcc -Wall -I$(INCDIR) -nostartfiles -shared -rdynamic -o snap.so snap.c -fPIC -D$(TARGET) $(TARGET_CFLAGS)
+	gcc -Wall -g -I$(INCDIR) -shared -rdynamic -o snap.so snap.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS)

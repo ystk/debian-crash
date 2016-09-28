@@ -68,59 +68,99 @@ struct vmcore_data {
 	ulong switch_stack;
 	uint num_prstatus_notes;
 	void *nt_prstatus_percpu[NR_CPUS];
-	struct xen_kdump_data *xen_kdump_data;
 	void *vmcoreinfo;
 	uint size_vmcoreinfo;
+/* Backup Region, first 640K of System RAM. */
+#define KEXEC_BACKUP_SRC_END	0x0009ffff
+	uint num_qemu_notes;
+	void *nt_qemu_percpu[NR_CPUS];
+	ulonglong backup_src_start;
+	ulong backup_src_size;
+	ulonglong backup_offset;
 };
 
-/*
- *  ELF note types for Xen dom0/hypervisor kdumps.
- *  The comments below are from xen/include/public/elfnote.h.
- */
+#define DUMP_ELF_INCOMPLETE  0x1   /* dumpfile is incomplete */
 
 /*
- * System information exported through crash notes.
- *
- * The kexec / kdump code will create one XEN_ELFNOTE_CRASH_INFO
- * note in case of a system crash. This note will contain various
- * information about the system, see xen/include/xen/elfcore.h.
+ * S390 CPU timer ELF note
  */
-#define XEN_ELFNOTE_CRASH_INFO 0x1000001
+#ifndef NT_S390_TIMER
+#define NT_S390_TIMER 0x301
+#endif
 
 /*
- * System registers exported through crash notes.
- *
- * The kexec / kdump code will create one XEN_ELFNOTE_CRASH_REGS
- * note per cpu in case of a system crash. This note is architecture
- * specific and will contain registers not saved in the "CORE" note.
- * See xen/include/xen/elfcore.h for more information.
+ * S390 TOD clock comparator ELF note
  */
-#define XEN_ELFNOTE_CRASH_REGS 0x1000002
+#ifndef NT_S390_TODCMP
+#define NT_S390_TODCMP 0x302
+#endif
 
-
-/* 
- * For (temporary) backwards compatibility.
+/*
+ * S390 TOD programmable register ELF note
  */
-#define NT_XEN_KDUMP_CR3 0x10000001
+#ifndef NT_S390_TODPREG
+#define NT_S390_TODPREG 0x303
+#endif
 
-struct xen_kdump_data {
-	ulong flags;
-	ulong cr3;
-	ulong p2m_mfn;
-	char *page;
-	ulong last_mfn_read;
-	ulong last_pmd_read;
-	ulong cache_hits;
-	ulong accesses;
-	int p2m_frames;
-        ulong *p2m_mfn_frame_list;
-	ulong xen_phys_start;
-	int xen_major_version;
-	int xen_minor_version;
+/*
+ * S390 control registers ELF note
+ */
+#ifndef NT_S390_CTRS
+#define NT_S390_CTRS 0x304
+#endif
+
+/*
+ * S390 prefix ELF note
+ */
+#ifndef NT_S390_PREFIX
+#define NT_S390_PREFIX 0x305
+#endif
+
+/*
+ * S390 vector registers 0-15 upper half note (16 * u64)
+ */
+#ifndef NT_S390_VXRS_LOW
+#define NT_S390_VXRS_LOW 0x309
+#endif
+
+/*
+ * S390 vector registers 16-31 note (16 * u128)
+ */
+#ifndef NT_S390_VXRS_HIGH
+#define NT_S390_VXRS_HIGH 0x30a
+#endif
+
+#define MAX_KCORE_ELF_HEADER_SIZE (32768)
+
+struct proc_kcore_data {
+	uint flags;
+	uint segments;
+	char *elf_header;
+        Elf64_Ehdr *elf64;
+	Elf64_Phdr *load64;
+        Elf32_Ehdr *elf32;
+	Elf32_Phdr *load32;
 };
 
-#define KDUMP_P2M_INIT  (0x1)
-#define KDUMP_CR3       (0x2)
-#define KDUMP_MFN_LIST  (0x4)
+struct QEMUCPUSegment {
+    uint32_t selector;
+    uint32_t limit;
+    uint32_t flags;
+    uint32_t pad;
+    uint64_t base;
+};
 
-#define P2M_FAILURE ((physaddr_t)(0xffffffffffffffffLL))
+typedef struct QEMUCPUSegment QEMUCPUSegment;
+
+struct QEMUCPUState {
+    uint32_t version;
+    uint32_t size;
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip, rflags;
+    QEMUCPUSegment cs, ds, es, fs, gs, ss;
+    QEMUCPUSegment ldt, tr, gdt, idt;
+    uint64_t cr[5];
+};
+
+typedef struct QEMUCPUState QEMUCPUState;

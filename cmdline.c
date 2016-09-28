@@ -1,8 +1,8 @@
 /* cmdline.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2015 David Anderson
+ * Copyright (C) 2002-2015 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,12 +21,14 @@ static void restore_sanity(void);
 static void restore_ifile_sanity(void);
 static int pseudo_command(char *);
 static void check_special_handling(char *);
+static int is_executable_in_PATH(char *);
 static int is_shell_script(char *);
 static void list_aliases(char *);
 static int allocate_alias(int);
 static int alias_exists(char *);
 static void resolve_aliases(void);
 static int setup_redirect(int);
+int multiple_pipes(char **);
 static int output_command_to_pids(void);
 static void set_my_tty(void);
 static char *signame(int);
@@ -35,6 +37,9 @@ static void wait_for_children(ulong);
 #define ZOMBIES_ONLY (1)
 #define ALL_CHILDREN (2)
 int shell_command(char *);
+static void modify_orig_line(char *, struct args_input_file *);
+static void modify_expression_arg(char *, char **, struct args_input_file *);
+static int verify_args_input_file(char *);
 
 #define READLINE_LIBRARY
 
@@ -59,7 +64,7 @@ process_command_line(void)
 
 	if (!(pc->flags & 
 	    (READLINE|SILENT|CMDLINE_IFILE|RCHOME_IFILE|RCLOCAL_IFILE))) 
-		fprintf(fp, pc->prompt);
+		fprintf(fp, "%s", pc->prompt);
 	fflush(fp);
 
 	/*
@@ -128,9 +133,9 @@ process_command_line(void)
 		
 		check_special_handling(pc->command_line);
         } else {
-                fflush(fp);
         	if (fgets(pc->command_line, BUFSIZE-1, stdin) == NULL)
 			clean_exit(1);
+		clean_line(pc->command_line);
 		strcpy(pc->orig_line, pc->command_line);
         }
 
@@ -192,6 +197,37 @@ check_special_handling(char *s)
         }
 }
 
+static int
+is_executable_in_PATH(char *filename)
+{
+	char *buf1, *buf2;
+	char *tok, *path;
+	int retval;
+
+        if ((path = getenv("PATH"))) {
+		buf1 = GETBUF(strlen(path)+1);
+		buf2 = GETBUF(strlen(path)+1);
+		strcpy(buf2, path);
+	} else
+		return FALSE;
+
+	retval = FALSE;
+	tok = strtok(buf2, ":");
+	while (tok) {
+		sprintf(buf1, "%s/%s", tok, filename);
+		if (file_exists(buf1, NULL) && 
+		    (access(buf1, X_OK) == 0)) {
+			retval = TRUE;
+			break;
+		}
+		tok = strtok(NULL, ":");
+	}
+
+	FREEBUF(buf1);
+	FREEBUF(buf2);
+
+	return retval;
+}
 
 /*
  *  At this point the only pseudo commands are the "r" (repeat) and 
@@ -200,9 +236,11 @@ check_special_handling(char *s)
  *    1. an "r" alone, or "!!" along, just means repeat the last command.
  *    2. an "r" followed by a number, means repeat that command from the
  *       history table.
- *    3. an "r" followed by one or more non-decimal characters means to
+ *    3. an "!" followed by a number that is not the name of a command 
+ *       in the user's PATH, means repeat that command from the history table.
+ *    4. an "r" followed by one or more non-decimal characters means to
  *       seek back until a line-beginning match is found. 
- *    4. an "h" alone, or a string beginning with "hi", means history.
+ *    5. an "h" alone, or a string beginning with "hi", means history.
  */
 static int
 pseudo_command(char *input)
@@ -239,6 +277,11 @@ pseudo_command(char *input)
                 goto rerun;
         }
 
+        if ((input[0] == '!') && decimal(&input[1], 0) &&
+	    !is_executable_in_PATH(first_nonspace(&input[1]))) {
+		p = first_nonspace(&input[1]);
+		goto rerun;
+	}
 
 	if (STRNEQ(input, "r ")) {
                 if (!history_offset)
@@ -419,7 +462,7 @@ setup_scroll_command(void)
  *  Care is taken to segregate:
  *
  *   1. expressions encompassed by parentheses, or
- *   2. strings encompassed by apostrophes. 
+ *   2. strings encompassed by single or double quotation marks
  *
  *  When either of the above are in affect, no redirection is done.
  *
@@ -436,7 +479,7 @@ setup_redirect(int origin)
 	int append;
 	int expression;
 	int string;
-	int ret;
+	int ret ATTRIBUTE_UNUSED;
 	FILE *pipe;
 	FILE *ofile;
 
@@ -454,15 +497,16 @@ setup_redirect(int origin)
 	if (FIRSTCHAR(p) == '|' || FIRSTCHAR(p) == '!')
 		pc->redirect |= REDIRECT_SHELL_COMMAND;
 
-	expression = string = FALSE;
+	expression = 0;
+	string = FALSE;
 
 	while (*p) {
 		if (*p == '(')
-			expression = TRUE;
+			expression++;
 		if (*p == ')')
-			expression = FALSE;
+			expression--;
 
-		if (*p == '"')
+		if ((*p == '"') || (*p == '\''))
 			string = !string;
 
 		if (!(expression || string) && 
@@ -504,11 +548,8 @@ setup_redirect(int origin)
 				break;
 			}
 
-			if (strstr(p, "|")) {
-				p = rindex(p, '|') + 1;
-				p = first_nonspace(p);
+			if (multiple_pipes(&p))
 				pc->redirect |= REDIRECT_MULTI_PIPE;
-			}
 
 			strcpy(pc->pipe_command, p);
 			null_first_space(pc->pipe_command);
@@ -615,6 +656,40 @@ setup_redirect(int origin)
 	pc->redirect |= REDIRECT_NOT_DONE;
 
 	return REDIRECT_NOT_DONE;
+}
+
+/*
+ *  Find the last command in an input line that possibly contains 
+ *  multiple pipes.
+ */
+int
+multiple_pipes(char **input)
+{
+	char *p, *found;
+	int quote;
+
+	found = NULL;
+	quote = FALSE;
+
+	for (p = *input; *p; p++) {
+		if ((*p == '\'') || (*p == '"')) {
+			quote = !quote;
+			continue;
+		} else if (quote)
+			continue;
+
+		if (*p == '|') {
+			if (STRNEQ(p, "||"))
+				break;
+                        found = first_nonspace(p+1);
+		}
+	}
+
+	if (found) {
+		*input = found;
+		return TRUE;
+	} else
+		return FALSE;
 }
 
 void
@@ -735,9 +810,10 @@ output_command_to_pids(void)
 	char *arglist[MAXARGS];
 	int argc;
 	FILE *pipe;
-	int retries;
+	int retries, shell_has_exited;
 
 	retries = 0;
+	shell_has_exited = FALSE;
 	pc->pipe_pid = pc->pipe_shell_pid = 0;
         sprintf(lookfor, "(%s)", pc->pipe_command);
 	stall(1000);
@@ -757,8 +833,11 @@ retry:
                                         p_pid = strtok(NULL, " ");
                                         pgrp = strtok(NULL, " ");
 				        if (STREQ(name, "(sh)") &&
-					    (atoi(p_pid) == getpid())) 
+					    (atoi(p_pid) == getpid())) { 
 						pc->pipe_shell_pid = atoi(pid);
+						if (STREQ(status, "Z"))
+							shell_has_exited = TRUE;
+					}
                                         if (STREQ(name, lookfor) &&
                                             ((atoi(p_pid) == getpid()) ||
 				             (atoi(p_pid) == pc->pipe_shell_pid)
@@ -778,11 +857,15 @@ retry:
 		closedir(dirp);
         }
 
-	if (!pc->pipe_pid && ((retries++ < 10) || pc->pipe_shell_pid)) {
+	if (!pc->pipe_pid && !shell_has_exited && 
+	    ((retries++ < 10) || pc->pipe_shell_pid)) {
 		stall(1000);
 		goto retry;
 	}
-		
+
+	console("getpid: %d pipe_shell_pid: %d pipe_pid: %d\n",
+		getpid(), pc->pipe_shell_pid, pc->pipe_pid);
+
 	if (pc->pipe_pid)	
 		return pc->pipe_pid;
 
@@ -872,11 +955,28 @@ cmdline_init(void)
 
 	SIGACTION(SIGPIPE, SIG_IGN, &pc->sigaction, NULL);
 
-	if ((pc->prompt = (char *)malloc(strlen(pc->program_name)+3)) == NULL)
-		pc->prompt = "> ";
-	else
-		sprintf(pc->prompt, "%s> ", pc->program_name);
+	set_command_prompt(NULL);
+}
 
+
+/*
+ *  Create and stash the original prompt, but allow changes during runtime.
+ */
+void
+set_command_prompt(char *new_prompt)
+{
+	static char *orig_prompt = NULL;
+
+	if (!orig_prompt) {
+		if (!(orig_prompt = (char *)malloc(strlen(pc->program_name)+3)))
+			error(FATAL, "cannot malloc prompt string\n");
+		sprintf(orig_prompt, "%s> ", pc->program_name);
+	}
+
+	if (new_prompt)
+		pc->prompt = new_prompt;
+	else
+		pc->prompt = orig_prompt;
 }
 
 /*
@@ -884,7 +984,7 @@ cmdline_init(void)
  *  Signal number 0 is sent for a generic restart.
  */
 #define MAX_RECURSIVE_SIGNALS (10)
-#define MAX_SIGINTS_ACCEPTED  (3)
+#define MAX_SIGINTS_ACCEPTED  (1)
 
 void
 restart(int sig)
@@ -893,6 +993,9 @@ restart(int sig)
 
 	console("restart (%s) %s\n", signame(sig), 
 		pc->flags & IN_GDB ? "(in gdb)" : "(in crash)");
+
+	if (sig == SIGUSR2)
+		clean_exit(1);
 
         if (pc->flags & IN_RESTART) {
                 fprintf(stderr, 
@@ -925,6 +1028,10 @@ restart(int sig)
 		pc->flags &= ~IN_RESTART;
 		if (pc->sigint_cnt == MAX_SIGINTS_ACCEPTED) {
 			restore_sanity();
+			if (pc->ifile_in_progress) {
+				pc->ifile_in_progress = 0;
+				pc->ifile_offset = 0;
+			}
 			break;
 		}
 		return;
@@ -937,7 +1044,7 @@ restart(int sig)
 		break;
 	}
 
-	fprintf(fp, "\n");
+	fprintf(stderr, "\n");
 
 	pc->flags &= ~(IN_FOREACH|IN_GDB|IN_RESTART);
 	longjmp(pc->main_loop_env, 1);
@@ -1047,13 +1154,19 @@ restore_sanity(void)
 		pc->ifile = NULL;
 	}
 
-	if (pc->tmpfile) {
-		close_tmpfile();
-	}
+        if (pc->args_ifile) {
+                fclose(pc->args_ifile);
+                pc->args_ifile = NULL;
+        }
 
-	if (pc->tmpfile2) {
+	if (pc->tmpfile)
+		close_tmpfile();
+
+	if (pc->tmpfile2)
 		close_tmpfile2();
-	}
+
+	if (pc->cmd_cleanup)
+		pc->cmd_cleanup(pc->cmd_cleanup_arg);
 
 	if (pc->flags & TTY) {
 		if ((fd = open("/dev/tty", O_RDONLY)) < 0) {
@@ -1101,6 +1214,9 @@ restore_sanity(void)
 	clear_vma_cache();
 	clear_active_set();
 
+	if (kt->ikconfig_flags & IKCONFIG_LOADED)
+		read_in_kernel_config(IKCFG_FREE);
+
 	/*
 	 *  Call the cleanup() function of any extension.
 	 */
@@ -1111,7 +1227,7 @@ restore_sanity(void)
 		}
         }
 
-	if (CRASHDEBUG(4)) {
+	if (CRASHDEBUG(5)) {
                 dump_filesys_table(0);
 		dump_vma_cache(0);
 		dump_text_value_cache(0);
@@ -1119,6 +1235,8 @@ restore_sanity(void)
 	
 	if (REMOTE())
 		remote_clear_pipeline();
+
+	hq_close();
 }
 
 /*
@@ -1143,9 +1261,11 @@ restore_ifile_sanity(void)
         }
 
         if (pc->flags & TTY) {
-                if ((fd = open("/dev/tty", O_RDONLY)) < 0) 
-			error(FATAL, "/dev/tty: %s\n", strerror(errno));
-                
+                if ((fd = open("/dev/tty", O_RDONLY)) < 0) {
+                        console("/dev/tty: %s\n", strerror(errno));
+                        clean_exit(1);
+                }
+ 
                 if (tcsetattr(fd, TCSANOW, &pc->termios_orig) == -1) 
 			error(FATAL, "tcsetattr /dev/tty: %s\n",
                                 strerror(errno));
@@ -1160,6 +1280,8 @@ restore_ifile_sanity(void)
 	restore_gdb_sanity();
 
 	free_all_bufs();
+
+	hq_close();
 }
 
 /*
@@ -1317,6 +1439,8 @@ exec_input_file(void)
 		restore_ifile_sanity();
         	BZERO(pc->command_line, BUFSIZE);
         	BZERO(pc->orig_line, BUFSIZE);
+		if (this & (RCHOME_IFILE|RCLOCAL_IFILE))
+			pc->curcmd_flags |= FROM_RCFILE;
 
 		pc->ifile_offset = ftell(pc->ifile);
 
@@ -1351,16 +1475,15 @@ exec_input_file(void)
 		if (!(argcnt = parse_line(pc->command_line, args)))
 			continue;
 
-		if ((this & (RCHOME_IFILE|RCLOCAL_IFILE)) &&
-		    (STREQ(args[0], "set") || STREQ(args[0], "alias")))
-			continue;
-
                 if (!(pc->flags & SILENT)) {
                         fprintf(fp, "%s%s", pc->prompt, buf);
                         fflush(fp);
                 }
 
                 exec_command();
+
+		if (received_SIGINT())
+			goto done_input;
         }
 
 done_input:
@@ -1523,18 +1646,14 @@ is_alias(char *s)
 }
 
 /*
- *  .rc file commands that consist of either "set" or "alias" commands
- *  are performed during initialization.  Determine which is being requested, 
- *  and pass the line to either cmd_set() or allocate_alias().  If any
- *  runtime commands are found, flag them for later execution by 
- *  exec_rc_commands().
+ *  .rc file commands that are "set" commands may be performed prior 
+ *  to initialization, so pass them to cmd_set() for consideration.  
+ *  All other commands are flagged for execution by exec_input_file()
+ *  after session initialization is complete.
  */
 void
 resolve_rc_cmd(char *s, int origin)
 {
-	int i;
-	struct alias_data *ad;
-
 	clean_line(s);
 
 	if (*s == '#')
@@ -1543,34 +1662,19 @@ resolve_rc_cmd(char *s, int origin)
 	if ((argcnt = parse_line(s, args)) == 0)
 		return;
 
-	/*
-	 *  If the command is a built-in alias of "set", switch the
-         *  args so that it will be caught by the subsequent set-string
-         *  check below.
-	 */
-	if ((argcnt == 1) && 
-	    (ad = is_alias(args[0])) &&
-	    STREQ(ad->args[0], "set")) {
-		argcnt = ad->argcnt;
-		for (i = 0; i < ad->argcnt; i++)
-			args[i] = ad->args[i];
-	}
-
 	if (STREQ(args[0], "set")) {
 		optind = 0;
 		cmd_set();
-	} else if (STREQ(args[0], "alias") && (argcnt > 2))
-		allocate_alias(origin);
-	else {
-        	switch (origin)
-        	{
-        	case ALIAS_RCHOME:
-                	pc->flags |= RCHOME_IFILE;
-                	break;
-        	case ALIAS_RCLOCAL:
-                	pc->flags |= RCLOCAL_IFILE;
-               	 	break;
-        	}
+	}
+
+	switch (origin)
+	{
+	case ALIAS_RCHOME:
+		pc->flags |= RCHOME_IFILE;
+		break;
+	case ALIAS_RCLOCAL:
+		pc->flags |= RCLOCAL_IFILE;
+		break;
 	}
 
 	return;
@@ -1893,16 +1997,11 @@ cmd_repeat(void)
 
 	check_special_handling(buf);
 
-#ifdef TODO
-	/* 
-	 * make aliases work... 
-	 */
 	strcpy(pc->command_line, buf);
 	resolve_aliases();
 	if (!argcnt)
 		return;
-	concat_args(buf, 0, FALSE);
-#endif
+	strcpy(buf, pc->command_line);
 
 	strcpy(bufsave, buf);
 	argcnt = parse_line(buf, args);
@@ -1959,6 +2058,8 @@ readline_init(void)
 		rl_bind_key_in_map(CTRL('P'), rl_get_previous_history,
 			vi_insertion_keymap);
 		rl_bind_key_in_map(CTRL('N'), rl_get_next_history,
+			vi_insertion_keymap);
+		rl_bind_key_in_map(CTRL('l'), rl_clear_screen,
 			vi_insertion_keymap);
 
 		rl_generic_bind(ISFUNC, "[A", (char *)rl_get_previous_history, 
@@ -2177,17 +2278,330 @@ shell_command(char *cmd)
         }
 
         while (fgets(buf, BUFSIZE, pipe))
-		fprintf(fp, buf);
+		fputs(buf, fp);
         pclose(pipe);
 
 	return REDIRECT_SHELL_COMMAND;
 }
 
-int minimal_functions(char *name)
+static int 
+verify_args_input_file(char *fileptr)
 {
-	return  STREQ("log", name) || STREQ("help",name)  || \
-		STREQ("dis", name) || STREQ("q", name)    || \
-		STREQ("sym", name) || STREQ("exit", name) || \
-		STREQ("rd", name)  || STREQ("eval", name) || \
-		STREQ("set", name); 
+	struct stat stat;
+
+	if (!file_exists(fileptr, &stat)) {
+		if (CRASHDEBUG(1))
+			error(INFO, "%s: no such file\n", fileptr);
+	} else if (!S_ISREG(stat.st_mode)) {
+		if (CRASHDEBUG(1))
+			error(INFO, "%s: not a regular file\n", fileptr);
+	} else if (!stat.st_size) {
+		if (CRASHDEBUG(1))
+			error(INFO, "%s: file is empty\n", fileptr);
+	} else if (!file_readable(fileptr)) {
+		if (CRASHDEBUG(1))
+			error(INFO, "%s: permission denied\n", fileptr);
+	} else
+		return TRUE;
+
+	return FALSE;
+}
+
+/*
+ * Verify a command line argument input file.
+ */
+
+#define NON_FILENAME_CHARS "*?!|\'\"{}<>;,^()$~"
+
+int 
+is_args_input_file(struct command_table_entry *ct, struct args_input_file *aif)
+{
+	int c, start, whites, args_used;
+	char *p1, *p2, *curptr, *fileptr;
+	char buf[BUFSIZE];
+	int retval;
+
+	if (pc->curcmd_flags & NO_MODIFY)
+		return FALSE;
+
+	BZERO(aif, sizeof(struct args_input_file));
+	retval = FALSE;
+
+	if (STREQ(ct->name, "gdb")) {
+		curptr = pc->orig_line;
+next_gdb:
+		if ((p1 = strstr(curptr, "<"))) {
+			while (STRNEQ(p1, "<<")) {
+				p2 = p1+2;
+			        if (!(p1 = strstr(p2, "<")))
+					return retval;
+			}
+		}
+
+		if (!p1)
+			return retval;
+
+		start = p1 - curptr;
+		p2 = p1+1;
+
+		for (whites = 0; whitespace(*p2); whites++)
+			p2++;
+
+		if (*p2 == NULLCHAR)
+			return retval;
+
+		strcpy(buf, p2);
+		p2 = buf;
+
+		if (*p2) {
+			fileptr = p2;
+			while (*p2 && !whitespace(*p2) && 
+				(strpbrk(p2, NON_FILENAME_CHARS) != p2))
+				p2++;
+			*p2 = NULLCHAR;
+			if (verify_args_input_file(fileptr)) {
+				if (retval == TRUE) {
+					error(INFO, 
+					    "ignoring multiple argument input files: "
+					    "%s and %s\n",
+						aif->fileptr, fileptr);
+					return FALSE;
+				}
+				aif->start = start;
+				aif->resume = start + (p2-buf) + whites + 1;
+				aif->fileptr = GETBUF(strlen(fileptr)+1);
+				strcpy(aif->fileptr, fileptr);
+				aif->is_gdb_cmd = TRUE;
+				retval = TRUE;
+			}
+		}
+
+		curptr = p1+1;
+		goto next_gdb;
+	}
+
+	for (c = 0; c < argcnt; c++) {
+		if (STRNEQ(args[c], "<") && !STRNEQ(args[c], "<<")) { 
+			if (strlen(args[c]) > 1) {
+				fileptr = &args[c][1];
+				args_used = 1;
+			} else {
+		    		if ((c+1) == argcnt)
+					error(FATAL, 
+					    "< requires a file argument\n");
+				fileptr = args[c+1];
+				args_used = 2;
+			}
+
+			if (!verify_args_input_file(fileptr))
+				continue;
+
+			if (retval == TRUE)
+				error(FATAL, 
+				    "multiple input files are not supported\n");
+
+			aif->index = c;
+			aif->fileptr = GETBUF(strlen(fileptr)+1);
+			strcpy(aif->fileptr, fileptr);
+			aif->args_used = args_used;
+			retval = TRUE;
+			continue;
+		} 
+
+		if (STRNEQ(args[c], "(")) {
+			curptr = args[c];
+next_expr:
+			if ((p1 = strstr(curptr, "<"))) {
+				while (STRNEQ(p1, "<<")) {
+					p2 = p1+2;
+					if (!(p1 = strstr(p2, "<")))
+						continue;
+				}
+			}
+
+			if (!p1)
+				continue;
+
+			start = p1 - curptr;
+			p2 = p1+1;
+
+			for (whites = 0; whitespace(*p2); whites++)
+				p2++;
+
+			if (*p2 == NULLCHAR)
+				continue;
+
+			strcpy(buf, p2);
+			p2 = buf;
+
+			if (*p2) {
+				fileptr = p2;
+				while (*p2 && !whitespace(*p2) && 
+					(strpbrk(p2, NON_FILENAME_CHARS) != p2))
+					p2++;
+				*p2 = NULLCHAR;
+
+				if (!verify_args_input_file(fileptr))
+					continue;
+
+				if (retval == TRUE) {
+					error(INFO, 
+					    "ignoring multiple argument input files: "
+					    "%s and %s\n",
+						aif->fileptr, fileptr);
+					return FALSE;
+				}
+		
+				retval = TRUE;
+
+				aif->in_expression = TRUE;
+				aif->args_used = 1;
+				aif->index = c;
+				aif->start = start;
+				aif->resume = start + (p2-buf) + whites + 1;
+				aif->fileptr = GETBUF(strlen(fileptr)+1);
+				strcpy(aif->fileptr, fileptr);
+			}
+
+			curptr = p1+1; 
+			goto next_expr;
+		}
+	}
+
+	return retval;
+}
+
+static void
+modify_orig_line(char *inbuf, struct args_input_file *aif)
+{
+	char buf[BUFSIZE];
+
+	strcpy(buf, pc->orig_line);
+	strcpy(&buf[aif->start], inbuf);
+	strcat(buf, &pc->orig_line[aif->resume]);
+	strcpy(pc->orig_line, buf);
+}
+
+static void
+modify_expression_arg(char *inbuf, char **aif_args, struct args_input_file *aif)
+{
+	char *old, *new;
+
+	old = aif_args[aif->index];
+	new = GETBUF(strlen(aif_args[aif->index]) + strlen(inbuf));
+
+	strcpy(new, old);
+	strcpy(&new[aif->start], inbuf);
+	strcat(new, &old[aif->resume]);
+
+	aif_args[aif->index] = new;
+}
+
+/*
+ *  Sequence through an args input file, and for each line,
+ *  reinitialize the global args[] and argcnt, and issue the command.
+ */
+void
+exec_args_input_file(struct command_table_entry *ct, struct args_input_file *aif)
+{
+	char buf[BUFSIZE];
+	int i, c, aif_cnt;
+	int orig_argcnt;
+	char *aif_args[MAXARGS];
+	char *new_args[MAXARGS];
+	char *orig_args[MAXARGS];
+	char orig_line[BUFSIZE];
+	char *save_args[MAXARGS];
+	char save_line[BUFSIZE];
+
+	if ((pc->args_ifile = fopen(aif->fileptr, "r")) == NULL)
+		error(FATAL, "%s: %s\n", aif->fileptr, strerror(errno));
+
+	if (aif->is_gdb_cmd)
+		strcpy(orig_line, pc->orig_line);
+
+	BCOPY(args, orig_args, sizeof(args));
+	orig_argcnt = argcnt;
+
+	/*
+	 *  Commands cannot be trusted to leave the arguments intact.
+	 *  Stash them here and restore them each time through the loop.
+	 */
+	save_args[0] = save_line;
+	for (i = 0; i < orig_argcnt; i++) {
+		strcpy(save_args[i], orig_args[i]);
+		save_args[i+1] = save_args[i] + strlen(save_args[i]) + 2;
+	}
+
+	while (fgets(buf, BUFSIZE-1, pc->args_ifile)) {
+		clean_line(buf);
+		if ((strlen(buf) == 0) || (buf[0] == '#'))
+			continue;		
+
+		for (i = 1; i < orig_argcnt; i++)
+			strcpy(orig_args[i], save_args[i]);
+
+		if (aif->is_gdb_cmd) {
+			console("(gdb) before: [%s]\n", orig_line);
+			strcpy(pc->orig_line, orig_line);
+			modify_orig_line(buf, aif);
+			console("(gdb)  after: [%s]\n", pc->orig_line);
+		} else if (aif->in_expression) {
+			console("expr before: [%s]\n", orig_args[aif->index]);
+			BCOPY(orig_args, aif_args, sizeof(aif_args));
+			modify_expression_arg(buf, aif_args, aif);
+			BCOPY(aif_args, args, sizeof(aif_args));
+			console("expr  after: [%s]\n", args[aif->index]);
+		} else {
+			if (!(aif_cnt = parse_line(buf, aif_args)))
+				continue;
+
+			for (i = 0; i < orig_argcnt; i++)
+				console("%s[%d]:%s %s", 
+					(i == 0) ? "before: " : "", 
+					i, orig_args[i],
+					(i+1) == orig_argcnt ? "\n" : "");
+	
+			for (i = 0; i < aif->index; i++)
+				new_args[i] = orig_args[i];
+			for (i = aif->index, c = 0; c < aif_cnt; c++, i++)
+				new_args[i] = aif_args[c];
+			for (i = aif->index + aif_cnt, 
+			     c = aif->index + aif->args_used;
+			     c < orig_argcnt; c++, i++)
+				new_args[i] = orig_args[c];
+	
+			argcnt = orig_argcnt - aif->args_used + aif_cnt;
+			new_args[argcnt] = NULL;
+			BCOPY(new_args, args, sizeof(args));
+
+			for (i = 0; i < argcnt; i++)
+				console("%s[%d]:%s %s", 
+					(i == 0) ? " after: " : "", 
+					i, args[i],
+					(i+1) == argcnt ? "\n" : "");
+		}
+
+		optind = argerrs = 0;
+		pc->cmdgencur++;
+
+		if (setjmp(pc->foreach_loop_env))
+			pc->flags &= ~IN_FOREACH;
+		else {
+			pc->flags |= IN_FOREACH;
+			(*ct->func)();
+			pc->flags &= ~IN_FOREACH;
+		}
+
+		if (pc->cmd_cleanup)
+			pc->cmd_cleanup(pc->cmd_cleanup_arg);
+
+		free_all_bufs();
+
+		if (received_SIGINT())
+			break;		
+	}
+
+	fclose(pc->args_ifile);
+	pc->args_ifile = NULL;
 }

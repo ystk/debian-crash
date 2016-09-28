@@ -1,7 +1,7 @@
 /*
  * Qemu save VM loader
  *
- * Copyright (C) 2009, 2010 Red Hat, Inc.
+ * Copyright (C) 2009, 2010, 2011 Red Hat, Inc.
  * Written by Paolo Bonzini.
  *
  * Portions Copyright (C) 2009 David Anderson
@@ -169,6 +169,7 @@ get_qemu128 (FILE *fp, union qemu_uint128_t *result)
 #define RAM_SAVE_FLAG_MEM_SIZE	0x04
 #define RAM_SAVE_FLAG_PAGE	0x08
 #define RAM_SAVE_FLAG_EOS	0x10
+#define RAM_SAVE_FLAG_CONTINUE	0x20
 #define RAM_SAVE_ADDR_MASK	(~4095LL)
 
 #define RAM_OFFSET_COMPRESSED	(~(off_t)255)
@@ -192,36 +193,85 @@ ram_alloc (struct qemu_device_ram *dram, uint64_t size)
 	dram->last_ram_offset = size;
 }
 
+#ifndef ATTRIBUTE_UNUSED
+#define ATTRIBUTE_UNUSED __attribute__ ((__unused__))
+#endif
+
+static int
+get_string (FILE *fp, char *name)
+{
+	size_t items ATTRIBUTE_UNUSED;
+	int sz = (uint8_t) getc (fp);
+	if (sz == EOF)
+		return -1;
+	items = fread (name, sz, 1, fp);
+	name[sz] = 0;
+	return sz;
+}
+
+static void
+ram_read_blocks (FILE *fp, uint64_t size)
+{
+	char name[257];
+	/* The RAM block table is a list of block names followed by
+	   their sizes.  Read it until the sizes sum up to SIZE bytes.  */
+	while (size) {
+		get_string (fp, name);
+		size -= get_be64 (fp);
+	}
+}
+
 static uint32_t
 ram_load (struct qemu_device *d, FILE *fp, enum qemu_save_section sec)
 {
+	char name[257];
 	struct qemu_device_ram *dram = (struct qemu_device_ram *)d;
 	uint64_t header;
+	static int pc_ram = 0;
 
-	do {
+	for (;;) {
 		uint64_t addr;
 		off_t entry;
 
 		header = get_be64 (fp);
+		if (feof (fp) || ferror (fp))
+			return 0;
+		if (header & RAM_SAVE_FLAG_EOS)
+			break;
+
 		assert (!(header & RAM_SAVE_FLAG_FULL));
 
 		addr = header & RAM_SAVE_ADDR_MASK;
-		if (header & RAM_SAVE_FLAG_MEM_SIZE)
-			ram_alloc (dram, addr);
 
-		else if (header & RAM_SAVE_FLAG_COMPRESS) {
-//			dram->offsets[addr / 4096] =
+		if (header & RAM_SAVE_FLAG_MEM_SIZE) {
+			ram_alloc (dram, addr);
+			if (d->version_id >= 4)
+				ram_read_blocks(fp, addr);
+			continue;
+		}
+
+		if (d->version_id >= 4 && !(header & RAM_SAVE_FLAG_CONTINUE)) {
+			get_string(fp, name);
+			if (strcmp(name, "pc.ram") == 0)
+				pc_ram = 1;
+			else
+				pc_ram = 0;
+		}
+
+		if (header & RAM_SAVE_FLAG_COMPRESS) {
 			entry = RAM_OFFSET_COMPRESSED | getc(fp);
-			store_mapfile_offset(addr, &entry);
+			if ((d->version_id == 3) || 
+			    (d->version_id >= 4 && pc_ram))
+				store_mapfile_offset(addr, &entry);
 		}
 		else if (header & RAM_SAVE_FLAG_PAGE) {
-//			dram->offsets[addr / 4096] = ftell (fp);
 			entry = ftell(fp);
-			store_mapfile_offset(addr, &entry);
+			if ((d->version_id == 3) || 
+			    (d->version_id >= 4 && pc_ram))
+				store_mapfile_offset(addr, &entry);
 			fseek (fp, 4096, SEEK_CUR);
 		}
-
-	} while (!(header & RAM_SAVE_FLAG_EOS) && !feof (fp) && !ferror (fp));
+	}
 
 	dram->fp = fp;
 	return QEMU_FEATURE_RAM;
@@ -238,7 +288,7 @@ int
 ram_read_phys_page (struct qemu_device_ram *dram, void *buf, uint64_t addr)
 {
 	off_t ofs;
-	ssize_t bytes;
+	ssize_t bytes ATTRIBUTE_UNUSED;
 
         if (addr >= dram->last_ram_offset)
                 return false;
@@ -264,7 +314,7 @@ ram_init_load (struct qemu_device_list *dl,
 		ram_free
 	};
 
-	assert (version_id == 3);
+	assert (version_id == 3 || version_id == 4);
 	kvm->mapinfo.ram_version_id = version_id;
 	return device_alloc (dl, sizeof (struct qemu_device_ram),
 			     &ram, section_id, instance_id, version_id);
@@ -362,7 +412,7 @@ cpu_common_init_load (struct qemu_device_list *dl,
 
 /* CPU loader.  */
 
-static inline int
+static inline uint64_t
 get_be_long (FILE *fp, int size)
 {
 	uint32_t a = size == 32 ? 0 : get_be32 (fp);
@@ -387,19 +437,46 @@ cpu_load_seg (FILE *fp, struct qemu_x86_seg *seg, int size)
 	seg->flags = get_be32 (fp);
 }
 
+static bool
+v12_has_xsave_state(FILE *fp)
+{
+	char name[257];
+	bool ret = true;
+	long offset = ftell(fp); // save offset
+
+        /*
+	 * peek into byte stream to check for APIC vmstate
+	 */
+	if (getc(fp) == QEMU_VM_SECTION_FULL) {
+		get_be32(fp); // skip section id
+		get_string(fp, name);
+		if (strcmp(name, "apic") == 0)
+			ret = false;
+	}
+	fseek(fp, offset, SEEK_SET); // restore offset
+
+	return ret;
+}
+
 static uint32_t
 cpu_load (struct qemu_device *d, FILE *fp, int size)
 {
 	struct qemu_device_x86 *dx86 = (struct qemu_device_x86 *)d;
 	uint32_t qemu_hflags = 0, qemu_hflags2 = 0;
-	int nregs = size == 32 ? 8 : 16;
+	int nregs;
 	uint32_t version_id = dx86->dev_base.version_id;
 	uint32_t rhel5_version_id;
 	int i;
+	off_t restart;
 
 	struct qemu_device *drhel5;
 	struct qemu_device_cpu_common *dcpu;
 
+	if (kvm->flags & KVMHOST_32)
+		size = 32;
+	restart = ftello(fp);
+retry:
+	nregs = size == 32 ? 8 : 16;
 	drhel5 = device_find_instance (d->list, "__rhel5", 0);
 	if (drhel5 || (version_id >= 7 && version_id <= 9)) {
 		rhel5_version_id = version_id;
@@ -417,7 +494,7 @@ cpu_load (struct qemu_device *d, FILE *fp, int size)
 	if (dcpu) {
 		dx86->halted = dcpu->halted;
 		dx86->irq = dcpu->irq;
-		device_free ((struct qemu_device *) dcpu);
+//		device_free ((struct qemu_device *) dcpu);
 	}
 
 	for (i = 0; i < nregs; i++)
@@ -480,7 +557,7 @@ cpu_load (struct qemu_device *d, FILE *fp, int size)
 	dx86->smm = qemu_hflags		& (1 << 19);
 
 	if (version_id == 4)
-		return QEMU_FEATURE_CPU;
+		goto store;
 
 	dx86->pat = get_be64 (fp);
 	qemu_hflags2 = get_be32 (fp);
@@ -562,6 +639,26 @@ cpu_load (struct qemu_device *d, FILE *fp, int size)
 		dx86->kvm.system_time_msr = get_be64 (fp);
 		dx86->kvm.wall_clock_msr = get_be64 (fp);
 	}
+
+	if (version_id >= 12 && v12_has_xsave_state(fp)) {
+		dx86->xcr0 = get_be64 (fp);
+		dx86->xstate_bv = get_be64 (fp);
+
+		for (i = 0; i < nregs; i++)
+			get_qemu128 (fp, &dx86->ymmh_regs[i]);
+	}
+
+store:
+	if (!kvmdump_regs_store(d->instance_id, dx86)) {
+		size = 32;
+		kvm->flags |= KVMHOST_32;
+		fseeko(fp, restart, SEEK_SET);
+		dprintf("cpu_load: invalid registers: retry with 32-bit host\n");
+		goto retry;
+	}
+
+	if (dcpu)
+		device_free ((struct qemu_device *) dcpu);
 
 	return QEMU_FEATURE_CPU;
 }
@@ -773,6 +870,8 @@ struct libvirt_header {
 	uint32_t	padding[16];
 };
 
+static long device_search(const struct qemu_device_loader *, FILE *);
+
 static struct qemu_device *
 device_get (const struct qemu_device_loader *devices,
 	    struct qemu_device_list *dl, enum qemu_save_section sec, FILE *fp)
@@ -780,29 +879,41 @@ device_get (const struct qemu_device_loader *devices,
 	char name[257];
 	uint32_t section_id, instance_id, version_id;
 //	bool live;
-	size_t items;
-	int sz;
+	const struct qemu_device_loader *devp;
+	long next_device_offset;
 
+next_device:
+	devp = devices;
+	if (sec == QEMU_VM_SUBSECTION) {
+		get_string(fp, name);
+		goto search_device;
+	}
 	section_id = get_be32 (fp);
 	if (sec != QEMU_VM_SECTION_START &&
 	    sec != QEMU_VM_SECTION_FULL)
 		return device_find (dl, section_id);
 
-	sz = getc (fp);
-	if (sz == EOF)
-		return NULL;
-	items = fread (name, sz, 1, fp);
-	name[sz] = 0;
+	get_string(fp, name);
 
 	instance_id = get_be32 (fp);
 	version_id = get_be32 (fp);
 
-	while (devices->name && strcmp (devices->name, name))
-		devices++;
-	if (!devices->name)
+	while (devp->name && strcmp (devp->name, name))
+		devp++;
+	if (!devp->name) {
+search_device:
+		dprintf("device_get: unknown/unsupported: \"%s\"\n", name);
+		if ((next_device_offset = device_search(devices, fp))) {
+			fseek(fp, next_device_offset, SEEK_CUR);
+			sec = getc(fp);
+			if (sec == QEMU_VM_EOF)
+				return NULL;
+			goto next_device;
+		}
 		return NULL;
+	}
 
-	return devices->init_load (dl, section_id, instance_id, version_id,
+	return devp->init_load (dl, section_id, instance_id, version_id,
 				   sec == QEMU_VM_SECTION_START, fp);
 }
 
@@ -812,7 +923,7 @@ qemu_load (const struct qemu_device_loader *devices, uint32_t required_features,
 {
 	struct qemu_device_list *result = NULL;
 	struct qemu_device *last = NULL;;
-	size_t items;
+	size_t items ATTRIBUTE_UNUSED;
 
 	switch (get_be32 (fp)) {
 	case QEMU_VM_FILE_MAGIC:
@@ -892,7 +1003,7 @@ is_qemu_vm_file(char *filename)
 	struct libvirt_header header;
 	FILE *vmp;
 	int retval;
-	size_t items;
+	size_t items ATTRIBUTE_UNUSED;
 	char *xml;
 
 	if ((vmp = fopen(filename, "r")) == NULL) {
@@ -954,7 +1065,7 @@ dump_qemu_header(FILE *out)
 	struct libvirt_header header;
 	char magic[4];
 	uint8_t c;
-	size_t items;
+	size_t items ATTRIBUTE_UNUSED;
 
 	rewind(kvm->vmp);
 	if (get_be32(kvm->vmp) == QEMU_VM_FILE_MAGIC) {
@@ -986,3 +1097,40 @@ dump_qemu_header(FILE *out)
 	fprintf(out, "\n");
 }
 
+static long
+device_search(const struct qemu_device_loader *devices, FILE *fp)
+{
+	uint sz;
+	char *p1, *p2;
+	long next_device_offset;
+	long remaining;
+	char buf[4096];
+	off_t current;
+
+	BZERO(buf, 4096);
+
+	current = ftello(fp);
+	if (fread(buf, sizeof(char), 4096, fp) != 4096) {
+		fseeko(fp, current, SEEK_SET);
+		return 0;
+	}
+	fseeko(fp, current, SEEK_SET);
+
+        while (devices->name) {
+		for (p1 = buf, remaining = 4096; 
+	     	    (p2 = memchr(p1, devices->name[0], remaining));
+	     	     p1 = p2+1, remaining = 4096 - (p1-buf)) {
+			sz = *((unsigned char *)p2-1);
+			if (STRNEQ(p2, devices->name) && 
+			    (strlen(devices->name) == sz)) {
+				*(p2+sz) = '\0';
+				dprintf("device_search: %s\n", p2);
+				next_device_offset = (p2-buf) - 6;
+				return next_device_offset;
+			}
+		}
+		devices++;
+	}
+
+	return 0;
+}
