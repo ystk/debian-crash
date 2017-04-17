@@ -1,8 +1,8 @@
 /* alpha.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2006, 2010-2013 David Anderson
+ * Copyright (C) 2002-2006, 2010-2013 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -28,13 +28,13 @@ static int alpha_backtrace_resync(struct gnu_request *, ulong,
 static void alpha_print_stack_entry(struct gnu_request *, ulong, 
 	char *, ulong, struct bt_info *);
 static int alpha_resync_speculate(struct gnu_request *, ulong,struct bt_info *);
-static int alpha_dis_filter(ulong, char *);
-static void dis_address_translation(ulong, char *);
+static int alpha_dis_filter(ulong, char *, unsigned int);
+static void dis_address_translation(ulong, char *, unsigned int);
 static void alpha_cmd_mach(void);
 static int alpha_get_smp_cpus(void);
 static void alpha_display_machine_stats(void);
 static void alpha_dump_line_number(char *, ulong);
-static void display_hwrpb(void);
+static void display_hwrpb(unsigned int);
 static void alpha_post_init(void);
 static struct line_number_hook alpha_line_number_hooks[];
 
@@ -589,6 +589,8 @@ alpha_print_stack_entry(struct gnu_request *req,
 			ulong flags,
 			struct bt_info *bt)
 {
+	struct load_module *lm;
+
 	if (BT_REFERENCE_CHECK(bt)) {
                 switch (bt->ref->cmdflags & (BT_REF_SYMBOL|BT_REF_HEXVAL))
                 {
@@ -606,10 +608,13 @@ alpha_print_stack_entry(struct gnu_request *req,
 			break;
 		}
 	} else {
-		fprintf(fp, "%s#%d [%lx] %s at %lx\n",
+		fprintf(fp, "%s#%d [%lx] %s at %lx",
         		req->curframe < 10 ? " " : "", req->curframe, req->sp,
 			STREQ(name, "strace") ?  "strace (via entSys)" : name, 
 			callpc);
+		if (module_symbol(callpc, NULL, &lm, NULL, 0))
+			fprintf(fp, " [%s]", lm->mod_name);
+		fprintf(fp, "\n");
 	}
 
 	if (!(flags & BT_SPECULATE))
@@ -791,7 +796,7 @@ alpha_frame_offset(struct gnu_request *req, ulong alt_pc)
 	}
 
 use_gdb:
-#if defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
+#ifndef GDB_5_3
 {
 	static int gdb_frame_offset_warnings = 10;
 
@@ -1949,7 +1954,7 @@ static struct instruction_data {
 } instruction_data = { {0} };
 
 static int
-alpha_dis_filter(ulong vaddr, char *buf)
+alpha_dis_filter(ulong vaddr, char *buf, unsigned int output_radix)
 {
 	struct syment *sp;
 	struct instruction_data *id;
@@ -1988,7 +1993,7 @@ alpha_dis_filter(ulong vaddr, char *buf)
 		return TRUE;   /* dis_address_translation() filter */
 	}
 
-	dis_address_translation(vaddr, buf);
+	dis_address_translation(vaddr, buf, output_radix);
 
 	if (!id->gp || !(sp = value_search(vaddr, NULL)) || 
 	    !STREQ(id->curfunc, sp->name)) {
@@ -2008,7 +2013,7 @@ alpha_dis_filter(ulong vaddr, char *buf)
 		p1 = strstr(strstr(buf, "jsr"), "0x");
 		sprintf(p1, "0x%lx <%s>%s", 
 			id->target,
-			value_to_symstr(id->target, buf2, pc->output_radix),
+			value_to_symstr(id->target, buf2, output_radix),
 			CRASHDEBUG(1) ? "  [PATCHED]\n" : "\n");
 		return TRUE;
 	}
@@ -2029,7 +2034,7 @@ alpha_dis_filter(ulong vaddr, char *buf)
  *  output radix on the translations.
  */
 static void
-dis_address_translation(ulong vaddr, char *inbuf)
+dis_address_translation(ulong vaddr, char *inbuf, unsigned int output_radix)
 {
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
@@ -2044,7 +2049,7 @@ dis_address_translation(ulong vaddr, char *inbuf)
 
 	if (colon) {
 		sprintf(buf1, "0x%lx <%s>", vaddr,
-			value_to_symstr(vaddr, buf2, pc->output_radix));
+			value_to_symstr(vaddr, buf2, output_radix));
 		sprintf(buf2, "%s%s", buf1, colon);
 		strcpy(inbuf, buf2);
 	}
@@ -2066,9 +2071,9 @@ dis_address_translation(ulong vaddr, char *inbuf)
 			return;
 
 		sprintf(buf1, "0x%lx <%s>\n", value,	
-			value_to_symstr(value, buf2, pc->output_radix));
+			value_to_symstr(value, buf2, output_radix));
 
-		sprintf(p1, buf1);
+		sprintf(p1, "%s", buf1);
 	}
 
 	console("    %s", inbuf);
@@ -2606,14 +2611,31 @@ alpha_get_smp_cpus(void)
 void
 alpha_cmd_mach(void)
 {
-        int c;
+        int c, cflag;
+	unsigned int radix;
 
-        while ((c = getopt(argcnt, args, "c")) != EOF) {
+	cflag = radix = 0;
+
+        while ((c = getopt(argcnt, args, "cxd")) != EOF) {
                 switch(c)
                 {
 		case 'c':
-			display_hwrpb();
-			return;
+			cflag++;
+			break;
+
+		case 'x':
+			if (radix == 10)
+				error(FATAL,
+					"-d and -x are mutually exclusive\n");
+			radix = 16;
+			break;
+
+		case 'd':
+			if (radix == 16)
+				error(FATAL,
+					"-d and -x are mutually exclusive\n");
+			radix = 10;
+			break;
 
                 default:
                         argerrs++;
@@ -2624,7 +2646,10 @@ alpha_cmd_mach(void)
         if (argerrs)
                 cmd_usage(pc->curcmd, SYNOPSIS);
 
-	alpha_display_machine_stats();
+	if (cflag)
+		display_hwrpb(radix);
+	else
+		alpha_display_machine_stats();
 }
 
 /*
@@ -2659,7 +2684,7 @@ alpha_display_machine_stats(void)
  *  Display the hwrpb_struct and each percpu_struct.
  */
 static void
-display_hwrpb(void)
+display_hwrpb(unsigned int radix)
 {
 	int cpu;
 	ulong hwrpb, percpu;
@@ -2675,12 +2700,12 @@ display_hwrpb(void)
                 "hwrpb processor_size", FAULT_ON_ERROR);
 
 	fprintf(fp, "HWRPB:\n");
-	dump_struct("hwrpb_struct", hwrpb, 0);
+	dump_struct("hwrpb_struct", hwrpb, radix);
 
 	for (cpu = 0; cpu < kt->cpus; cpu++) {
 		fprintf(fp, "\nCPU %d:\n", cpu); 
 		percpu = hwrpb + processor_offset + (processor_size * cpu);
-		dump_struct("percpu_struct", percpu, 0);
+		dump_struct("percpu_struct", percpu, radix);
 	}
 }
 

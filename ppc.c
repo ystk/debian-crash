@@ -1,8 +1,8 @@
 /* ppc.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2007, 2010-2014 David Anderson
+ * Copyright (C) 2002-2007, 2010-2014 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,6 +16,31 @@
  */ 
 #ifdef PPC
 #include "defs.h"
+#include <elf.h>
+
+
+#define MAX_PLATFORM_LEN	32	/* length for platform string */
+
+/* 
+ *  This structure was copied from kernel source
+ *  in include/asm-ppc/ptrace.h
+ */
+struct ppc_pt_regs {
+        long gpr[32];
+        long nip;
+        long msr;
+        long orig_gpr3;      /* Used for restarting system calls */
+        long ctr;
+        long link;
+        long xer;
+        long ccr;
+        long mq;             /* 601 only (not used at present) */
+                                /* Used on APUS to hold IPL value. */
+        long trap;           /* Reason for being here */
+        long dar;            /* Fault registers */
+        long dsisr;
+        long result;         /* Result of a system call */
+};
 
 static int ppc_kvtop(struct task_context *, ulong, physaddr_t *, int);
 static int ppc_uvtop(struct task_context *, ulong, physaddr_t *, int);
@@ -27,22 +52,231 @@ static int ppc_translate_pte(ulong, void *, ulonglong);
 
 static ulong ppc_processor_speed(void);
 static int ppc_eframe_search(struct bt_info *);
+static ulong ppc_in_irqstack(ulong);
 static void ppc_back_trace_cmd(struct bt_info *);
 static void ppc_back_trace(struct gnu_request *, struct bt_info *);
 static void get_ppc_frame(struct bt_info *, ulong *, ulong *);
 static void ppc_print_stack_entry(int,struct gnu_request *,
-	ulong, char *, struct bt_info *);
-static void ppc_exception_frame(ulong, struct bt_info *, struct gnu_request *);
+	ulong, ulong, struct bt_info *);
+static char *ppc_check_eframe(struct ppc_pt_regs *);
+static void ppc_print_eframe(char *, struct ppc_pt_regs *, struct bt_info *);
+static void ppc_print_regs(struct ppc_pt_regs *);
+static void ppc_display_full_frame(struct bt_info *, ulong, FILE *);
 static void ppc_dump_irq(int);
-static ulong ppc_get_pc(struct bt_info *);
-static ulong ppc_get_sp(struct bt_info *);
 static void ppc_get_stack_frame(struct bt_info *, ulong *, ulong *);
-static int ppc_dis_filter(ulong, char *);
+static int ppc_dis_filter(ulong, char *, unsigned int);
 static void ppc_cmd_mach(void);
 static int ppc_get_smp_cpus(void);
 static void ppc_display_machine_stats(void);
 static void ppc_dump_line_number(ulong);
 static struct line_number_hook ppc_line_number_hooks[];
+
+
+static struct machine_specific ppc_machine_specific = { 0 };
+static int probe_default_platform(char *);
+static int probe_ppc44x_platform(char *);
+static int probe_ppce500_platform(char *);
+static void ppc_probe_base_platform(void);
+
+typedef int (*probe_func_t) (char *);
+
+probe_func_t probe_platforms[] = {
+	probe_ppc44x_platform,	/* 44x chipsets */
+	probe_ppce500_platform, /* E500 chipsets */
+	probe_default_platform, /* This should be at the end */
+	NULL
+};
+
+/* Don't forget page flags definitions for each platform */
+#define PLATFORM_PAGE_FLAGS_SETUP(PLT)		\
+do {						\
+	_PAGE_PRESENT = PLT##_PAGE_PRESENT;	\
+	_PAGE_USER = PLT##_PAGE_USER;		\
+	_PAGE_RW = PLT##_PAGE_RW;		\
+	_PAGE_GUARDED = PLT##_PAGE_GUARDED;	\
+	_PAGE_COHERENT = PLT##_PAGE_COHERENT;	\
+	_PAGE_NO_CACHE = PLT##_PAGE_NO_CACHE;	\
+	_PAGE_WRITETHRU = PLT##_PAGE_WRITETHRU;	\
+	_PAGE_DIRTY = PLT##_PAGE_DIRTY;		\
+	_PAGE_ACCESSED = PLT##_PAGE_ACCESSED;	\
+	_PAGE_HWWRITE = PLT##_PAGE_HWWRITE;	\
+	_PAGE_SHARED = PLT##_PAGE_SHARED;	\
+} while (0)
+
+static int
+probe_ppc44x_platform(char *name)
+{
+	/* 44x include ppc440* and ppc470 */
+	if (STRNEQ(name, "ppc440") || STREQ(name, "ppc470")) {
+		PPC_PLATFORM = strdup(name);
+		PLATFORM_PAGE_FLAGS_SETUP(PPC44x);
+
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+struct fsl_booke_tlbcam {
+#define NUM_TLBCAMS	(64)
+#define LAST_TLBCAM	(0x40)
+	uint index;
+	struct {
+		ulong start;
+		ulong limit;
+		physaddr_t phys;
+	} tlbcamrange;
+	struct {
+		uint MAS0;
+		uint MAS1;
+		ulong MAS2;
+		uint MAS3;
+		uint MAS7;
+	} tlbcam;
+};
+
+static int
+fsl_booke_vtop(ulong vaddr, physaddr_t *paddr, int verbose)
+{
+	struct fsl_booke_tlbcam *fsl_mmu;
+	int i, found;
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "[Searching tlbcam address mapping]\n");
+	fsl_mmu = MMU_SPECIAL;
+	for (i = 0, found = FALSE;;i++, fsl_mmu++) {
+		if (vaddr >= fsl_mmu->tlbcamrange.start &&
+		    vaddr < fsl_mmu->tlbcamrange.limit) {
+			*paddr = fsl_mmu->tlbcamrange.phys +
+				 (vaddr - fsl_mmu->tlbcamrange.start);
+			found = TRUE;
+			break;
+		}
+		if (fsl_mmu->index & LAST_TLBCAM)
+			break;
+	}
+	if (found && verbose) {
+		/* TLBCAM segment attributes */
+		fprintf(fp, "\n  TLBCAM[%u]: MAS0     MAS1     MAS2     "
+			"MAS3     MAS7\n",
+			(fsl_mmu->index & ~LAST_TLBCAM));
+		fprintf(fp, "             %-8x %-8x %-8lx %-8x %-8x\n",
+			fsl_mmu->tlbcam.MAS0, fsl_mmu->tlbcam.MAS1,
+			fsl_mmu->tlbcam.MAS2, fsl_mmu->tlbcam.MAS3,
+			fsl_mmu->tlbcam.MAS7);
+		/* TLBCAM range */
+		fprintf(fp, "             VIRTUAL RANGE : %lx - %lx\n",
+			fsl_mmu->tlbcamrange.start, fsl_mmu->tlbcamrange.limit);
+		fprintf(fp, "             PHYSICAL RANGE: %llx - %llx\n",
+			fsl_mmu->tlbcamrange.phys,
+			fsl_mmu->tlbcamrange.phys + (fsl_mmu->tlbcamrange.limit
+				- fsl_mmu->tlbcamrange.start));
+		/* translated addr and its tlbcam's offset. */
+		fprintf(fp, "  => VIRTUAL  PHYSICAL TLBCAM-OFFSET\n");
+		fprintf(fp, "     %-8lx %-8llx %lu\n", vaddr, *paddr,
+			vaddr - fsl_mmu->tlbcamrange.start);
+	}
+	if (CRASHDEBUG(1))
+		fprintf(fp, "[tlbcam search end]\n");
+
+	return found;
+}
+
+static void
+fsl_booke_mmu_setup(void)
+{
+	struct fsl_booke_tlbcam *fsl_mmu;
+	uint i, tlbcam_index;
+	ulong tlbcam_addrs, TLBCAM;
+
+	readmem(symbol_value("tlbcam_index"), KVADDR, &tlbcam_index,
+		sizeof(uint), "tlbcam_index", FAULT_ON_ERROR);
+	if (tlbcam_index != 0 && tlbcam_index < NUM_TLBCAMS) {
+		fsl_mmu = calloc(tlbcam_index, sizeof(*fsl_mmu));
+		if (!fsl_mmu) {
+			error(FATAL, "fsl_mmu calloc() failed\n");
+			return;
+		}
+		tlbcam_addrs = symbol_value("tlbcam_addrs");
+		TLBCAM = symbol_value("TLBCAM");
+		for (i = 0; i < tlbcam_index; i++) {
+			fsl_mmu[i].index = i;
+			readmem(tlbcam_addrs +
+					i * sizeof(fsl_mmu[i].tlbcamrange),
+				KVADDR, &fsl_mmu[i].tlbcamrange,
+				sizeof(fsl_mmu[i].tlbcamrange), "tlbcam_addrs",
+				FAULT_ON_ERROR);
+			readmem(TLBCAM + i * sizeof(fsl_mmu[i].tlbcam), KVADDR,
+				&fsl_mmu[i].tlbcam, sizeof(fsl_mmu[i].tlbcam),
+				"TLBCAM", FAULT_ON_ERROR);
+		}
+		fsl_mmu[i - 1].index |= LAST_TLBCAM;
+		MMU_SPECIAL = fsl_mmu;
+		VTOP_SPECIAL = fsl_booke_vtop;
+	} else
+		error(INFO, "[%s]: can't setup tlbcam: tlbcam_index=%u\n",
+			PPC_PLATFORM, tlbcam_index);
+}
+
+static int
+probe_ppce500_platform(char *name)
+{
+	if (STRNEQ(name, "ppce500mc")) {
+		PPC_PLATFORM = strdup(name);
+		if (IS_PAE()) {
+			PTE_RPN_SHIFT = BOOKE3E_PTE_RPN_SHIFT;
+			PLATFORM_PAGE_FLAGS_SETUP(BOOK3E);
+			/* Set special flag for book3e */
+			_PAGE_K_RW = BOOK3E_PAGE_KERNEL_RW;
+		} else
+			PLATFORM_PAGE_FLAGS_SETUP(FSL_BOOKE);
+		fsl_booke_mmu_setup();
+
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static int
+probe_default_platform(char *name)
+{
+	if (IS_PAE()) {
+		error(INFO, "platform \"%s\" 64bit PTE fall through\n", name);
+		error(INFO, "vmalloc translation could not work!\n");
+	}
+
+	/* Use the default definitions */
+	PPC_PLATFORM = strdup(name);
+	PLATFORM_PAGE_FLAGS_SETUP(DEFAULT);
+
+	return TRUE;
+}
+
+#undef PLATFORM_PAGE_FLAGS_SETUP
+
+/*
+ * Find the platform of the crashing system and set the
+ * base_platform accordingly.
+ */
+void
+ppc_probe_base_platform(void)
+{
+	probe_func_t probe;
+	char platform_name[MAX_PLATFORM_LEN];
+	ulong ptr;
+	int i;
+
+	if(!try_get_symbol_data("powerpc_base_platform", sizeof(ulong), &ptr) ||
+		read_string(ptr, platform_name, MAX_PLATFORM_LEN - 1) == 0)
+		/* Let us fallback to default definitions */
+		strcpy(platform_name, "(unknown)");
+
+	for (i = 0; probe_platforms[i] != NULL; i++) {
+		probe = probe_platforms[i];
+		if (probe(platform_name))
+			break;
+	}
+}
 
 /*
  *  Do all necessary machine-specific setup here.  This is called twice,
@@ -53,9 +287,17 @@ ppc_init(int when)
 {
 	uint cpu_features;
 	ulong cur_cpu_spec;
+	struct datatype_member pte = {
+		.name = "pte_t",
+	};
 
 	switch (when)
 	{
+	case SETUP_ENV:
+		machdep->machspec = &ppc_machine_specific;
+		machdep->process_elf_notes = process_elf32_notes;
+		break;
+
 	case PRE_SYMTAB:
 		machdep->verify_symbol = ppc_verify_symbol;
                 if (pc->flags & KERNEL_DEBUG_QUERY)
@@ -64,7 +306,7 @@ ppc_init(int when)
                 machdep->pageshift = ffs(machdep->pagesize) - 1;
                 machdep->pageoffset = machdep->pagesize - 1;
                 machdep->pagemask = ~((ulonglong)machdep->pageoffset);
-		machdep->stacksize = machdep->pagesize * 2;
+		machdep->stacksize = PPC_STACK_SIZE;
                 if ((machdep->pgd = (char *)malloc(PAGESIZE())) == NULL)
                         error(FATAL, "cannot malloc pgd space.");
                 machdep->pmd = machdep->pgd;
@@ -74,7 +316,6 @@ ppc_init(int when)
                 machdep->last_pmd_read = 0;
                 machdep->last_ptbl_read = 0;
 		machdep->verify_paddr = generic_verify_paddr;
-		machdep->ptrs_per_pgd = PTRS_PER_PGD;
 		break;
 
 	case PRE_GDB:
@@ -100,23 +341,42 @@ ppc_init(int when)
 		machdep->line_number_hooks = ppc_line_number_hooks;
 		machdep->value_to_symbol = generic_machdep_value_to_symbol;
                 machdep->init_kernel_pgd = NULL;
+
 		break;
 
 	case POST_GDB:
+		/* gdb interface got available, resolve PTE right now. */
+		PTE_SIZE = DATATYPE_SIZE(&pte);
+		if (PTE_SIZE < 0)
+			error(FATAL,
+			      "gdb could not handle \"pte_t\" size request\n");
+		/* Check if we have 64bit PTE on 32bit system */
+		if (PTE_SIZE == sizeof(ulonglong))
+			machdep->flags |= PAE;
+		/* Find the platform where we crashed */
+		ppc_probe_base_platform();
+		if (!PTE_RPN_SHIFT)
+			PTE_RPN_SHIFT = PAGE_SHIFT;
+
 		machdep->vmalloc_start = ppc_vmalloc_start;
 		MEMBER_OFFSET_INIT(thread_struct_pg_tables, 
  			"thread_struct", "pg_tables");
 
-                STRUCT_SIZE_INIT(irqdesc, "irqdesc");
-        	STRUCT_SIZE_INIT(irq_desc_t, "irq_desc_t");
-               	/* as of 2.3.x PPC uses the generic irq handlers */
-        	if (VALID_SIZE(irq_desc_t)) 
-                	machdep->dump_irq = generic_dump_irq;
-		else {
+		if (VALID_SIZE(irq_desc_t)) {
+			/*
+			 * Use generic irq handlers for recent kernels whose
+			 * irq_desc_t have been initialized in kernel_init().
+			 */
+			machdep->dump_irq = generic_dump_irq;
+			machdep->show_interrupts = generic_show_interrupts;
+			machdep->get_irq_affinity = generic_get_irq_affinity;
+		} else {
 			machdep->dump_irq = ppc_dump_irq;
-                	MEMBER_OFFSET_INIT(irqdesc_action, "irqdesc", "action");
-                	MEMBER_OFFSET_INIT(irqdesc_ctl, "irqdesc", "ctl");
-                	MEMBER_OFFSET_INIT(irqdesc_level, "irqdesc", "level");
+			STRUCT_SIZE_INIT(irqdesc, "irqdesc");
+			STRUCT_SIZE_INIT(irq_desc_t, "irq_desc_t");
+			MEMBER_OFFSET_INIT(irqdesc_action, "irqdesc", "action");
+			MEMBER_OFFSET_INIT(irqdesc_ctl, "irqdesc", "ctl");
+			MEMBER_OFFSET_INIT(irqdesc_level, "irqdesc", "level");
 		}
 
                 MEMBER_OFFSET_INIT(device_node_type, "device_node", "type");
@@ -136,8 +396,11 @@ ppc_init(int when)
 		if (symbol_exists("irq_desc"))
 			ARRAY_LENGTH_INIT(machdep->nr_irqs, irq_desc,
 				"irq_desc", NULL, 0);
+		else if (symbol_exists("nr_irqs"))
+			get_symbol_data("nr_irqs", sizeof(int),
+					&machdep->nr_irqs);
 		else
-			machdep->nr_irqs = 0;
+			machdep->nr_irqs = 512; /* NR_IRQS (at least) */
 		if (!machdep->hz) {
 			machdep->hz = HZ;
 			if (THIS_KERNEL_VERSION >= LINUX(2,6,0))
@@ -155,9 +418,22 @@ ppc_init(int when)
 			machdep->flags |= CPU_BOOKE;
 		machdep->section_size_bits = _SECTION_SIZE_BITS;
 		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
+		/*
+		 * IRQ stacks are introduced in 2.6 and also configurable.
+		 */
+		if ((THIS_KERNEL_VERSION >= LINUX(2,6,0)) &&
+			symbol_exists("hardirq_ctx"))
+			STRUCT_SIZE_INIT(irq_ctx, "hardirq_ctx");
+
+		STRUCT_SIZE_INIT(note_buf, "note_buf_t");
+		STRUCT_SIZE_INIT(elf_prstatus, "elf_prstatus");
 		break;
 
 	case POST_INIT:
+		break;
+
+	case LOG_ONLY:
+		machdep->kvbase = kt->vmcoreinfo._stext_SYMBOL;
 		break;
 	}
 }
@@ -168,9 +444,14 @@ ppc_dump_machdep_table(ulong arg)
         int others; 
  
         others = 0;
+	fprintf(fp, "           platform: %s\n", PPC_PLATFORM);
         fprintf(fp, "              flags: %lx (", machdep->flags);
 	if (machdep->flags & KSYMS_START)
 		fprintf(fp, "%sKSYMS_START", others++ ? "|" : "");
+	if (machdep->flags & PAE)
+		fprintf(fp, "%sPAE", others++ ? "|" : "");
+	if (machdep->flags & CPU_BOOKE)
+		fprintf(fp, "%sCPU_BOOKE", others++ ? "|" : "");
         fprintf(fp, ")\n");
 
 	fprintf(fp, "             kvbase: %lx\n", machdep->kvbase);
@@ -179,6 +460,11 @@ ppc_dump_machdep_table(ulong arg)
         fprintf(fp, "          pageshift: %d\n", machdep->pageshift);
         fprintf(fp, "           pagemask: %llx\n", machdep->pagemask);
         fprintf(fp, "         pageoffset: %lx\n", machdep->pageoffset);
+	fprintf(fp, "        pgdir_shift: %d\n", PGDIR_SHIFT);
+	fprintf(fp, "       ptrs_per_pgd: %d\n", PTRS_PER_PGD);
+	fprintf(fp, "       ptrs_per_pte: %d\n", PTRS_PER_PTE);
+	fprintf(fp, "           pte_size: %d\n", PTE_SIZE);
+	fprintf(fp, "      pte_rpn_shift: %d\n", PTE_RPN_SHIFT);
 	fprintf(fp, "          stacksize: %ld\n", machdep->stacksize);
         fprintf(fp, "                 hz: %d\n", machdep->hz);
         fprintf(fp, "                mhz: %ld\n", machdep->mhz);
@@ -196,6 +482,8 @@ ppc_dump_machdep_table(ulong arg)
 		fprintf(fp, "           dump_irq: generic_dump_irq()\n");
 	else
 		fprintf(fp, "           dump_irq: ppc_dump_irq()\n");
+	fprintf(fp, "    show_interrupts: generic_show_interrupts()\n");
+	fprintf(fp, "   get_irq_affinity: generic_get_irq_affinity()\n");
         fprintf(fp, "    get_stack_frame: ppc_get_stack_frame()\n");
         fprintf(fp, "      get_stackbase: generic_get_stackbase()\n");
         fprintf(fp, "       get_stacktop: generic_get_stacktop()\n");
@@ -219,13 +507,91 @@ ppc_dump_machdep_table(ulong arg)
         fprintf(fp, "                pgd: %lx\n", (ulong)machdep->pgd);
         fprintf(fp, "                pmd: %lx\n", (ulong)machdep->pmd);
         fprintf(fp, "               ptbl: %lx\n", (ulong)machdep->ptbl);
-	fprintf(fp, "       ptrs_per_pgd: %d\n", machdep->ptrs_per_pgd);
         fprintf(fp, "  section_size_bits: %ld\n", machdep->section_size_bits);
         fprintf(fp, "   max_physmem_bits: %ld\n", machdep->max_physmem_bits);
         fprintf(fp, "  sections_per_root: %ld\n", machdep->sections_per_root);
 	fprintf(fp, "           machspec: %lx\n", (ulong)machdep->machspec);
 }
 
+static ulonglong
+ppc_pte_physaddr(ulonglong pte)
+{
+	pte = pte >> PTE_RPN_SHIFT;	/* pfn */
+	pte = pte << PAGE_SHIFT;	/* physaddr */
+
+	return pte;
+}
+
+static int
+ppc_pgd_vtop(ulong *pgd, ulong vaddr, physaddr_t *paddr, int verbose)
+{
+	ulong *page_dir;
+	ulong pgd_pte, page_table, pte_index;
+	ulonglong pte;
+
+	if (verbose)
+		fprintf(fp, "PAGE DIRECTORY: %lx\n", (ulong)pgd);
+
+	page_dir = pgd + (vaddr >> PGDIR_SHIFT);
+
+	/*
+ 	 * Size of a pgd could be more than a PAGE.
+ 	 * So use PAGEBASE(page_dir), instead of 
+ 	 * PAGEBASE(pgd) for FILL_PGD()
+ 	 */
+        FILL_PGD(PAGEBASE((ulong)page_dir), KVADDR, PAGESIZE());
+        pgd_pte = ULONG(machdep->pgd + PAGEOFFSET((ulong)page_dir));
+
+	if (verbose)
+		fprintf(fp, "  PGD: %lx => %lx\n", (ulong)page_dir, pgd_pte);
+
+	if (!pgd_pte) {
+		if (VTOP_SPECIAL)
+			/*
+			 * This ppc platform have special address mapping
+			 * between vaddr and paddr which can not search from
+			 * standard page table.
+			 */
+			return VTOP_SPECIAL(vaddr, paddr, verbose);
+		goto no_page;
+	}
+
+	page_table = pgd_pte;
+	if (IS_BOOKE())
+		page_table = VTOP(page_table);
+
+        FILL_PTBL(PAGEBASE((ulong)page_table), PHYSADDR, PAGESIZE());
+	pte_index = (vaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+	if (IS_PAE())
+		pte = ULONGLONG(machdep->ptbl + PTE_SIZE * pte_index);
+
+	else
+	        pte = ULONG(machdep->ptbl + PTE_SIZE * pte_index);
+
+	if (verbose) 
+		fprintf(fp, "  PTE: %lx => %llx\n", pgd_pte, pte);
+
+	if (!(pte & _PAGE_PRESENT)) { 
+		if (pte && verbose) {
+			fprintf(fp, "\n");
+			ppc_translate_pte((ulong)pte, 0, pte);
+		}
+		goto no_page;
+	}
+
+	if (verbose) {
+		fprintf(fp, " PAGE: %llx\n\n", PAGEBASE(ppc_pte_physaddr(pte)));
+		ppc_translate_pte((ulong)pte, 0, pte);
+	}
+
+	*paddr = PAGEBASE(ppc_pte_physaddr(pte)) + PAGEOFFSET(vaddr);
+
+	return TRUE;
+
+no_page:
+	return FALSE;
+
+}
 
 /*
  *  Translates a user virtual address to its physical address.  cmd_vtop()
@@ -242,11 +608,6 @@ ppc_uvtop(struct task_context *tc, ulong vaddr, physaddr_t *paddr, int verbose)
 {
 	ulong mm, active_mm;
 	ulong *pgd;
-	ulong *page_dir;
-	ulong *page_middle;
-	ulong *page_table;
-	ulong pgd_pte;
-	ulong pte;
 
 	if (!tc)
 		error(FATAL, "current context invalid\n");
@@ -282,61 +643,7 @@ ppc_uvtop(struct task_context *tc, ulong vaddr, physaddr_t *paddr, int verbose)
 				FAULT_ON_ERROR);
 	}
 
-	if (verbose) 
-		fprintf(fp, "PAGE DIRECTORY: %lx\n", (ulong)pgd);
-
-	page_dir = pgd + (vaddr >> PGDIR_SHIFT);
-
-	FILL_PGD(PAGEBASE(pgd), KVADDR, PAGESIZE());
-	pgd_pte = ULONG(machdep->pgd + PAGEOFFSET(page_dir));
-
-	if (verbose)
-		fprintf(fp, "  PGD: %lx => %lx\n", (ulong)page_dir, pgd_pte);
-
-	if (!pgd_pte)
-		goto no_upage;
-
-	page_middle = (ulong *)pgd_pte;
-
-	if (machdep->flags & CPU_BOOKE)
-		page_table = page_middle + (BTOP(vaddr) & (PTRS_PER_PTE - 1));
-	else
-		page_table = (ulong *)(((pgd_pte & (ulong)machdep->pagemask) + machdep->kvbase) +
-			((ulong)BTOP(vaddr) & (PTRS_PER_PTE-1)));
-
-	if (verbose)
-		fprintf(fp, "  PMD: %lx => %lx\n",(ulong)page_middle, 
-			(ulong)page_table);
-	
-        FILL_PTBL(PAGEBASE(page_table), KVADDR, PAGESIZE());
-	pte = ULONG(machdep->ptbl + PAGEOFFSET(page_table));
-
-        if (verbose) 
-                fprintf(fp, "  PTE: %lx => %lx\n", (ulong)page_table, pte);
-
-	if (!(pte & _PAGE_PRESENT)) {
-		*paddr = pte;
-		if (pte && verbose) {
-			fprintf(fp, "\n");
-			ppc_translate_pte(pte, 0, 0);
-		}
-		goto no_upage;
-	}
-
-	if (!pte)
-		goto no_upage;
-
-	*paddr = PAGEBASE(pte) + PAGEOFFSET(vaddr);
-
-        if (verbose) {
-                fprintf(fp, " PAGE: %lx\n\n", PAGEBASE(pte));
-		ppc_translate_pte(pte, 0, 0);
-	}
-
-	return TRUE;
-
-no_upage:
-	return FALSE;
+	return ppc_pgd_vtop(pgd, vaddr, paddr, verbose);
 }
 
 /*
@@ -348,11 +655,6 @@ static int
 ppc_kvtop(struct task_context *tc, ulong kvaddr, physaddr_t *paddr, int verbose)
 {
 	ulong *pgd;
-	ulong *page_dir;
-	ulong *page_middle;
-	ulong *page_table;
-        ulong pgd_pte;
-        ulong pte;
 
 	if (!IS_KVADDR(kvaddr))
 		return FALSE;
@@ -369,58 +671,7 @@ ppc_kvtop(struct task_context *tc, ulong kvaddr, physaddr_t *paddr, int verbose)
 	}
 
 	pgd = (ulong *)vt->kernel_pgd[0];
-
-	if (verbose) 
-		fprintf(fp, "PAGE DIRECTORY: %lx\n", (ulong)pgd);
-
-	page_dir = pgd + (kvaddr >> PGDIR_SHIFT);
-
-        FILL_PGD(PAGEBASE(pgd), KVADDR, PAGESIZE());
-        pgd_pte = ULONG(machdep->pgd + PAGEOFFSET(page_dir));
-
-	if (verbose)
-		fprintf(fp, "  PGD: %lx => %lx\n", (ulong)page_dir, pgd_pte);
-
-	if (!pgd_pte)
-		goto no_kpage;
-
-	page_middle = (ulong *)pgd_pte;
-
-	if (machdep->flags & CPU_BOOKE)
-		page_table = page_middle + (BTOP(kvaddr) & (PTRS_PER_PTE - 1));
-	else
-		page_table = (ulong *)(((pgd_pte & (ulong)machdep->pagemask) + machdep->kvbase) +
-			((ulong)BTOP(kvaddr) & (PTRS_PER_PTE-1)));
-
-	if (verbose)
-		fprintf(fp, "  PMD: %lx => %lx\n", (ulong)page_middle, 
-			(ulong)page_table);
-
-        FILL_PTBL(PAGEBASE(page_table), KVADDR, PAGESIZE());
-        pte = ULONG(machdep->ptbl + PAGEOFFSET(page_table));
-
-	if (verbose) 
-		fprintf(fp, "  PTE: %lx => %lx\n", (ulong)page_table, pte);
-
-	if (!(pte & _PAGE_PRESENT)) { 
-		if (pte && verbose) {
-			fprintf(fp, "\n");
-			ppc_translate_pte(pte, 0, 0);
-		}
-		goto no_kpage;
-	}
-
-	if (verbose) {
-		fprintf(fp, " PAGE: %lx\n\n", PAGEBASE(pte));
-		ppc_translate_pte(pte, 0, 0);
-	}
-
-	*paddr = PAGEBASE(pte) + PAGEOFFSET(kvaddr);
-
-	return TRUE;
-
-no_kpage:
-	return FALSE;
+	return ppc_pgd_vtop(pgd, kvaddr, paddr, verbose);
 }
 
 /*
@@ -434,7 +685,8 @@ ppc_vmalloc_start(void)
 }
 
 /*
- *  PPC allows the idle_task to be non-page aligned, so we have to make
+ *  PPC tasks are all stacksize-aligned, except when split from the stack.
+ *  PPC also allows the idle_task to be non-page aligned, so we have to make
  *  an additional check through the idle_threads array.
  */
 static int
@@ -442,7 +694,9 @@ ppc_is_task_addr(ulong task)
 {
 	int i;
 
-        if (IS_KVADDR(task) && (ALIGNED_STACK_OFFSET(task) == 0))
+	if (tt->flags & THREAD_INFO)
+		return IS_KVADDR(task);
+	else if (IS_KVADDR(task) && (ALIGNED_STACK_OFFSET(task) == 0))
 		return TRUE;
 
 	for (i = 0; i < kt->cpus; i++)
@@ -463,7 +717,7 @@ ppc_processor_speed(void)
 	ulong res, value, ppc_md, md_setup_res;
 	ulong prep_setup_res;
 	ulong node, type, name, properties;
-	char str_buf[16];
+	char str_buf[32];
 	ulong len, mhz = 0;
 
 	if (machdep->mhz)
@@ -518,15 +772,28 @@ ppc_processor_speed(void)
 					    "clock frequency value",
                                             FAULT_ON_ERROR);
 					mhz /= 1000000;
-					
+					break;
+				} else if(len && (strcasecmp(str_buf,
+					"ibm,extended-clock-frequency") == 0)){
+					/* found the right cpu property */
+
+					readmem(properties+
+						OFFSET(property_value),
+						KVADDR, &value, sizeof(ulong),
+						"clock freqency pointer",
+						FAULT_ON_ERROR);
+					readmem(value, KVADDR, &mhz,
+						sizeof(ulong),
+						"clock frequency value",
+						FAULT_ON_ERROR);
+					mhz /= 1000000;
 					break;
 				}
 				/* keep looking */
-				
 				readmem(properties+
-				    OFFSET(property_next),
-				    KVADDR, &properties, sizeof(ulong), 
-				    "property next", FAULT_ON_ERROR);
+					OFFSET(property_next),
+					KVADDR, &properties, sizeof(ulong), 
+					"property next", FAULT_ON_ERROR);
 			}
 			if(!properties) {
 				/* didn't find the cpu speed for some reason */
@@ -546,19 +813,19 @@ ppc_processor_speed(void)
 			get_symbol_data("ppc_md", sizeof(void *), 
 				&ppc_md);
 			readmem(ppc_md + 
-		 	    OFFSET(machdep_calls_setup_residual), 
-			    KVADDR, &md_setup_res, 
-			    sizeof(ulong), "ppc_md setup_residual",
-			    FAULT_ON_ERROR);
+		 		OFFSET(machdep_calls_setup_residual), 
+				KVADDR, &md_setup_res, 
+				sizeof(ulong), "ppc_md setup_residual",
+				FAULT_ON_ERROR);
 				
 			if(prep_setup_res == md_setup_res) {
-			/* PREP machine */
+				/* PREP machine */
 				readmem(res+
-				    OFFSET(RESIDUAL_VitalProductData)+
-				    OFFSET(VPD_ProcessorHz),
-				    KVADDR, &mhz, sizeof(ulong), 
-				    "res VitalProductData", 
-				    FAULT_ON_ERROR);
+					OFFSET(RESIDUAL_VitalProductData)+
+					OFFSET(VPD_ProcessorHz),
+					KVADDR, &mhz, sizeof(ulong), 
+					"res VitalProductData", 
+					FAULT_ON_ERROR);
 					
 				mhz = (mhz > 1024) ? mhz >> 20 : mhz;
 			}
@@ -594,7 +861,7 @@ ppc_verify_symbol(const char *name, ulong value, char type)
 		machdep->flags |= KSYMS_START;
 
 	return (name && strlen(name) && (machdep->flags & KSYMS_START) &&
-	        !STREQ(name, "Letext"));
+	        !STREQ(name, "Letext") && !STRNEQ(name, "__func__."));
 }
 
 
@@ -626,7 +893,7 @@ ppc_get_task_pgd(ulong task)
  *  If a physaddr pointer is passed in, don't print anything.
  */
 static int
-ppc_translate_pte(ulong pte, void *physaddr, ulonglong unused)
+ppc_translate_pte(ulong pte32, void *physaddr, ulonglong pte64)
 {
 	int c, len1, len2, len3, others, page_present;
 	char buf[BUFSIZE];
@@ -635,22 +902,25 @@ ppc_translate_pte(ulong pte, void *physaddr, ulonglong unused)
 	char ptebuf[BUFSIZE];
 	char physbuf[BUFSIZE];
         char *arglist[MAXARGS];
-	ulong paddr;
+	ulonglong paddr;
 
-        paddr = PAGEBASE(pte);
-	page_present = (pte & _PAGE_PRESENT);
+	if (!IS_PAE())
+		pte64 = pte32;
+
+        paddr = PAGEBASE(ppc_pte_physaddr(pte64));
+	page_present = (pte64 & _PAGE_PRESENT);
 
 	if (physaddr) {
 		*((ulong *)physaddr) = paddr;
 		return page_present;
 	}
 
-	sprintf(ptebuf, "%lx", pte);
+	sprintf(ptebuf, "%llx", pte64);
 	len1 = MAX(strlen(ptebuf), strlen("PTE"));
 	fprintf(fp, "%s  ", mkstring(buf, len1, CENTER|LJUST, "PTE"));
 
-        if (!page_present && pte) {
-                swap_location(pte, buf);
+        if (!page_present && pte64) {
+                swap_location(pte64, buf);
                 if ((c = parse_line(buf, arglist)) != 3)
                         error(FATAL, "cannot determine swap location\n");
 
@@ -671,7 +941,7 @@ ppc_translate_pte(ulong pte, void *physaddr, ulonglong unused)
                 return page_present;
         }
 
-	sprintf(physbuf, "%lx", paddr);
+	sprintf(physbuf, "%llx", paddr);
 	len2 = MAX(strlen(physbuf), strlen("PHYSICAL"));
 	fprintf(fp, "%s  ", mkstring(buf, len2, CENTER|LJUST, "PHYSICAL"));
 
@@ -683,26 +953,39 @@ ppc_translate_pte(ulong pte, void *physaddr, ulonglong unused)
 	fprintf(fp, "(");
 	others = 0;
 
-	if (pte) {
-		if (pte & _PAGE_PRESENT)
+	if (pte64) {
+		if (_PAGE_PRESENT &&
+		    (pte64 & _PAGE_PRESENT) == _PAGE_PRESENT)
 			fprintf(fp, "%sPRESENT", others++ ? "|" : "");
-		if (pte & _PAGE_USER)
+		if (_PAGE_USER &&
+		    (pte64 & _PAGE_USER) == _PAGE_USER)
 			fprintf(fp, "%sUSER", others++ ? "|" : "");
-		if (pte & _PAGE_RW)
+		if (_PAGE_RW &&
+		    (pte64 & _PAGE_RW) == _PAGE_RW)
 			fprintf(fp, "%sRW", others++ ? "|" : "");
-		if (pte & _PAGE_GUARDED)
+		if (_PAGE_K_RW &&
+		    ((pte64 & _PAGE_K_RW) == _PAGE_K_RW))
+			fprintf(fp, "%sK-RW", others++ ? "|" : "");
+		if (_PAGE_GUARDED &&
+		    (pte64 & _PAGE_GUARDED) == _PAGE_GUARDED)
 			fprintf(fp, "%sGUARDED", others++ ? "|" : "");
-		if (pte & _PAGE_COHERENT)
+		if (_PAGE_COHERENT &&
+		    (pte64 & _PAGE_COHERENT) == _PAGE_COHERENT)
 			fprintf(fp, "%sCOHERENT", others++ ? "|" : "");
-		if (pte & _PAGE_NO_CACHE)
+		if (_PAGE_NO_CACHE &&
+		    (pte64 & _PAGE_NO_CACHE) == _PAGE_NO_CACHE)
 			fprintf(fp, "%sNO_CACHE", others++ ? "|" : "");
-		if (pte & _PAGE_WRITETHRU)
+		if (_PAGE_WRITETHRU &&
+		    (pte64 & _PAGE_WRITETHRU) == _PAGE_WRITETHRU)
 			fprintf(fp, "%sWRITETHRU", others++ ? "|" : "");
-		if (pte & _PAGE_DIRTY)
+		if (_PAGE_DIRTY &&
+		    (pte64 & _PAGE_DIRTY) == _PAGE_DIRTY)
 			fprintf(fp, "%sDIRTY", others++ ? "|" : "");
-		if (pte & _PAGE_ACCESSED)
+		if (_PAGE_ACCESSED &&
+		    (pte64 & _PAGE_ACCESSED) == _PAGE_ACCESSED)
 			fprintf(fp, "%sACCESSED", others++ ? "|" : "");
-		if (pte & _PAGE_HWWRITE)
+		if (_PAGE_HWWRITE &&
+		    (pte64 & _PAGE_HWWRITE) == _PAGE_HWWRITE)
 			fprintf(fp, "%sHWWRITE", others++ ? "|" : "");
 	} else
 		fprintf(fp, "no mapping");
@@ -717,31 +1000,34 @@ ppc_translate_pte(ulong pte, void *physaddr, ulonglong unused)
  *  Look for likely exception frames in a stack.
  */
 
-/* 
- *  This structure was copied from kernel source
- *  in include/asm-ppc/ptrace.h
- */
-struct ppc_pt_regs {
-        long gpr[32];
-        long nip;
-        long msr;
-        long orig_gpr3;      /* Used for restarting system calls */
-        long ctr;
-        long link;
-        long xer;
-        long ccr;
-        long mq;             /* 601 only (not used at present) */
-                                /* Used on APUS to hold IPL value. */
-        long trap;           /* Reason for being here */
-        long dar;            /* Fault registers */
-        long dsisr;
-        long result;         /* Result of a system call */
-};
-
 static int 
 ppc_eframe_search(struct bt_info *bt)
 {
 	return (error(FATAL, "ppc_eframe_search: function not written yet!\n"));
+}
+
+static ulong
+ppc_in_irqstack(ulong addr)
+{
+	int c;
+
+	if (!(tt->flags & IRQSTACKS))
+		return 0;
+
+	for (c = 0; c < kt->cpus; c++) {
+		if (tt->hardirq_ctx[c]) {
+			if ((addr >= tt->hardirq_ctx[c]) &&
+			    (addr < (tt->hardirq_ctx[c] + SIZE(irq_ctx))))
+				return tt->hardirq_ctx[c];
+		}
+		if (tt->softirq_ctx[c]) {
+			if ((addr >= tt->softirq_ctx[c]) &&
+			    (addr < (tt->softirq_ctx[c] + SIZE(irq_ctx))))
+				return tt->softirq_ctx[c];
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -787,50 +1073,119 @@ ppc_back_trace_cmd(struct bt_info *bt)
 static void
 ppc_back_trace(struct gnu_request *req, struct bt_info *bt)
 {
-        int frame;
-	int done;
+	int frame = 0;
+	ulong lr = 0;
+	ulong newpc = 0, newsp, marker;
+	int eframe_found;
 
-        for (frame = 0, done = FALSE; !done && (frame < 100); frame++) {
+	if (!INSTACK(req->sp, bt)) {
+		ulong irqstack;
+
+		if ((irqstack = ppc_in_irqstack(req->sp))) {
+			bt->stackbase = irqstack;
+			bt->stacktop = bt->stackbase + SIZE(irq_ctx);
+			alter_stackbuf(bt);
+		} else {
+			if (CRASHDEBUG(1))
+				fprintf(fp, "cannot find the stack info.\n");
+			return;
+		}
+	}
+
+	while (INSTACK(req->sp, bt)) {
+		newsp = *(ulong *)&bt->stackbuf[req->sp - bt->stackbase];
+		if (IS_KVADDR(newsp) && INSTACK(newsp, bt))
+			newpc = *(ulong *)&bt->stackbuf[newsp +
+							STACK_FRAME_LR_SAVE -
+							bt->stackbase];
 		if ((req->name = closest_symbol(req->pc)) == NULL) {
 			error(FATAL, 
-			    "ppc_back_trace hit unknown symbol (%lx).\n",
+				"ppc_back_trace hit unknown symbol (%lx).\n",
 				req->pc);
-			req->ra = req->pc = 0;
 			break;
 		}
 
 		bt->flags |= BT_SAVE_LASTSP;
-		ppc_print_stack_entry(frame, req, req->pc, req->name, bt);
+		ppc_print_stack_entry(frame, req, newsp, lr, bt);
 		bt->flags &= ~(ulonglong)BT_SAVE_LASTSP;
-		
+		lr = 0;
+
 		if (BT_REFERENCE_FOUND(bt))
 			return;
 
-		/* get the next sp and ip values */
-		readmem(req->sp, KVADDR, &req->sp, sizeof(ulong),
-			"stack frame", FAULT_ON_ERROR);
-
-		/* an actual valid end of the back-chain! */
-		if(req->sp == 0)
-			break;
-
-		if((req->sp - req->lastsp) >= sizeof(struct ppc_pt_regs)) {
-			/* there might be an exception frame here... */
-			ppc_exception_frame(req->lastsp, bt, req);
-		} else if(!IS_KVADDR(req->sp) || (req->sp < req->lastsp)) {
-			/* also possible one here... */
-			ppc_exception_frame(req->lastsp, bt, req);
+		eframe_found = FALSE;
+		/*
+		 * Is this frame an execption one?
+		 * In 2.6, 0x72656773 is saved and used
+		 * to determine the execption frame.
+		 */
+		if (THIS_KERNEL_VERSION < LINUX(2,6,0)) {
+			if (frame && (newsp - req->sp - STACK_FRAME_OVERHEAD >=
+				sizeof(struct ppc_pt_regs)))
+				/* there might be an exception frame here... */
+				eframe_found = TRUE;
+			/* also possible ones here... */
+			else if(!IS_KVADDR(newsp) || (newsp < req->sp))
+				eframe_found = TRUE;
+			else if (STREQ(req->name, ".ret_from_except"))
+				eframe_found = TRUE;
+		} else if ((newsp - req->sp - STACK_FRAME_OVERHEAD) >=
+				sizeof(struct ppc_pt_regs)){
+			readmem(req->sp + STACK_FRAME_MARKER, KVADDR, &marker,
+				sizeof(ulong), "frame marker", FAULT_ON_ERROR);
+			if (marker == STACK_FRAME_REGS_MARKER)
+				eframe_found = TRUE;
 		}
-		
-		if (!INSTACK(req->sp, bt) || 
-		    STREQ(req->name, "start_kernel"))
+		if (eframe_found) {
+			char *efrm_str;
+			struct ppc_pt_regs regs;
+
+			readmem(req->sp + STACK_FRAME_OVERHEAD, KVADDR, &regs,
+				sizeof(struct ppc_pt_regs),
+				"exception frame", FAULT_ON_ERROR);
+			efrm_str = ppc_check_eframe(&regs);
+			if (efrm_str) {
+				ppc_print_eframe(efrm_str, &regs, bt);
+				lr = regs.link;
+				newpc = regs.nip;
+				newsp = regs.gpr[1];
+			}
+		}
+
+		if (STREQ(req->name, "start_kernel"))
 			break;
 
-		readmem(req->sp+sizeof(long), KVADDR, &req->pc, sizeof(ulong),
-			"instruction pointer", FAULT_ON_ERROR);
+		req->pc = newpc;
+		req->sp = newsp;
+		frame++;
 	}
 
 	return;
+}
+
+static void
+ppc_display_full_frame(struct bt_info *bt, ulong nextsp, FILE *ofp)
+{
+	int i, u_idx;
+	ulong *nip;
+	ulong words, addr;
+	char buf[BUFSIZE];
+
+	if (!INSTACK(nextsp, bt))
+		nextsp =  bt->stacktop;
+
+	words = (nextsp - bt->frameptr) / sizeof(ulong);
+	addr = bt->frameptr;
+	u_idx = (bt->frameptr - bt->stackbase)/sizeof(ulong);
+	for (i = 0; i < words; i++, u_idx++) {
+		if (!(i & 1))
+			fprintf(ofp, "%s    %lx: ", i ? "\n" : "", addr);
+
+		nip = (ulong *)(&bt->stackbuf[u_idx*sizeof(ulong)]);
+		fprintf(ofp, "%s ", format_stack_entry(bt, buf, *nip, 0));
+		addr += sizeof(ulong);
+	}
+	fprintf(ofp, "\n");
 }
 
 /*
@@ -839,96 +1194,136 @@ ppc_back_trace(struct gnu_request *req, struct bt_info *bt)
 static void 
 ppc_print_stack_entry(int frame, 
 		      struct gnu_request *req, 
-		      ulong callpc, 	
-		      char *name, 
+		      ulong newsp, 	
+		      ulong lr, 
 		      struct bt_info *bt)
 {
+	struct load_module *lm;
+	char *lrname = NULL;
+	ulong offset;
+	struct syment *sp;
+	char *name_plus_offset;
+	char buf[BUFSIZE];
+
 	if (BT_REFERENCE_CHECK(bt)) {
                 switch (bt->ref->cmdflags & (BT_REF_SYMBOL|BT_REF_HEXVAL))
                 {
                 case BT_REF_SYMBOL:
-                        if (STREQ(name, bt->ref->str)) 
+                        if (STREQ(req->name, bt->ref->str)) 
                         	bt->ref->cmdflags |= BT_REF_FOUND;
                         break;
 
                 case BT_REF_HEXVAL:
-                        if (bt->ref->hexval == callpc) 
+                        if (bt->ref->hexval == req->pc) 
                                 bt->ref->cmdflags |= BT_REF_FOUND;
                         break;
                 }
 	} else {
-		fprintf(fp, "%s#%d [%lx] %s at %lx\n",
+		name_plus_offset = NULL;
+		if (bt->flags & BT_SYMBOL_OFFSET) {
+			sp = value_search(req->pc, &offset);
+			if (sp && offset) 
+				name_plus_offset = value_to_symstr(req->pc, buf, bt->radix);
+		}
+		
+		fprintf(fp, "%s#%d [%lx] %s at %lx",
         		frame < 10 ? " " : "", frame,
-                	req->sp, name, callpc);
+                	req->sp, name_plus_offset ? name_plus_offset : req->name, req->pc);
+		if (module_symbol(req->pc, NULL, &lm, NULL, 0))
+			fprintf(fp, " [%s]", lm->mod_name);
+
+		if (req->ra) {
+			/*
+			 * Previous frame is an exception one. If the func
+			 * symbol for the current frame is same as with
+			 * the previous frame's LR value, print "(unreliable)".
+			 */
+			lrname = closest_symbol(req->ra);
+			req->ra = 0;
+			if (!lrname) {
+				if (CRASHDEBUG(1))
+					error(FATAL,
+					"ppc_back_trace hit unknown symbol (%lx).\n",
+						req->ra);
+				return;
+			}
+		}
+		if (lr) {
+			/*
+			 * Link register value for an expection frame.
+			 */
+			if ((lrname = closest_symbol(lr)) == NULL) {
+				if (CRASHDEBUG(1))
+					error(FATAL,
+					"ppc_back_trace hit unknown symbol (%lx).\n",
+						lr);
+				return;
+			}
+			if (req->pc != lr) {
+				fprintf(fp, "\n [Link Register ] ");
+				fprintf(fp, " [%lx] %s at %lx",
+					req->sp, lrname, lr);
+			}
+			req->ra = lr;
+		}
+		if (!req->name || STREQ(req->name,lrname))
+			fprintf(fp, "  (unreliable)");
+		fprintf(fp, "\n");
 	}
 
 	if (bt->flags & BT_SAVE_LASTSP)
 		req->lastsp = req->sp;
 
+	bt->frameptr = req->sp;
+	if (bt->flags & BT_FULL)
+		if (IS_KVADDR(newsp))
+			ppc_display_full_frame(bt, newsp, fp);
 	if (bt->flags & BT_LINE_NUMBERS)
-		ppc_dump_line_number(callpc);
+		ppc_dump_line_number(req->pc);
 }
 
 /*
- *  Print exception frame information for PowerPC
+ *  Check whether the frame is exception one!
  */
+static char *
+ppc_check_eframe(struct ppc_pt_regs *regs)
+{
+	switch(regs->trap & ~0xF) {
+	case 0x200:
+		return "machine check";
+	case 0x300:
+		return "address error (store)";
+	case 0x400:
+		return "instruction bus error";
+	case 0x500:
+		return "interrupt";
+	case 0x600:
+		return "alingment";
+	case 0x700:
+		return "breakpoint trap";
+	case 0x800:
+		return "fpu unavailable";
+	case 0x900:
+		return "decrementer";
+	case 0xa00:
+		return "reserved";
+	case 0xb00:
+		return "reserved";
+	case 0xc00:
+		return "syscall";
+	case 0xd00:
+		return "single-step/watch";
+	case 0xe00:
+		return "fp assist";
+	}
+	/* No exception frame exists */
+	return NULL;
+}
+
 static void
-ppc_exception_frame(ulong addr, struct bt_info *bt, struct gnu_request *req)
+ppc_print_regs(struct ppc_pt_regs *regs)
 {
 	int i;
-	struct ppc_pt_regs regs;
-	
-	if (BT_REFERENCE_CHECK(bt))
-		return;
-
-	readmem(addr+16, KVADDR, &regs, sizeof(regs),
-		"exception frame", FAULT_ON_ERROR);
-	
-	switch(regs.trap) {
-	case 0x200:
-		fprintf(fp, "machine check");
-		break;
-	case 0x300:
-		fprintf(fp, "address error (store)");
-		break;
-	case 0x400:
-		fprintf(fp, "instruction bus error");
-		break;
-	case 0x500:
-		fprintf(fp, "interrupt");
-		break;
-	case 0x600:
-		fprintf(fp, "alingment");
-		break;
-	case 0x700:
-		fprintf(fp, "breakpoint trap");
-		break;
-	case 0x800:
-		fprintf(fp, "fpu unavailable");
-		break;
-	case 0x900:
-		fprintf(fp, "decrementer");
-		break;
-	case 0xa00:
-		fprintf(fp, "reserved");
-		break;
-	case 0xb00:
-		fprintf(fp, "reserved");
-		break;
-	case 0xc00:
-		fprintf(fp, "syscall");
-		break;
-	case 0xd00:
-		fprintf(fp, "single-step/watch");
-		break;
-	case 0xe00:
-		fprintf(fp, "fp assist");
-		break;
-	default: /* back trace ended, but no exception frame exists */
-		return;
-	}
-
-	fprintf(fp, " [%lx] exception frame:", regs.trap);
 
 	/* print out the gprs... */
 	for(i=0; i<32; i++) {
@@ -936,24 +1331,123 @@ ppc_exception_frame(ulong addr, struct bt_info *bt, struct gnu_request *req)
 			fprintf(fp, "\n");
 
 		fprintf(fp, "R%d:%s %08lx   ", i,
-			((i < 10) ? " " : ""), regs.gpr[i]);
+			((i < 10) ? " " : ""), regs->gpr[i]);
+		/*
+		 * In 2.6, some stack frame contains only partial regs set.
+		 * For the partial set, only 14 regs will be saved and trap
+		 * field will contain 1 in the least significant bit.
+		 */
+		if ((i == 13) && (regs->trap & 1))
+			break;
 	}
 
 	fprintf(fp, "\n");
 
 	/* print out the rest of the registers */
-	fprintf(fp, "NIP: %08lx   ", regs.nip);
-	fprintf(fp, "MSR: %08lx   ", regs.msr);
-	fprintf(fp, "OR3: %08lx   ", regs.orig_gpr3);
-	fprintf(fp, "CTR: %08lx\n", regs.ctr);
+	fprintf(fp, "NIP: %08lx   ", regs->nip);
+	fprintf(fp, "MSR: %08lx   ", regs->msr);
+	fprintf(fp, "OR3: %08lx   ", regs->orig_gpr3);
+	fprintf(fp, "CTR: %08lx\n", regs->ctr);
 
-	fprintf(fp, "LR:  %08lx   ", regs.link);
-	fprintf(fp, "XER: %08lx   ", regs.xer);
-	fprintf(fp, "CCR: %08lx   ", regs.ccr);
-	fprintf(fp, "MQ:  %08lx\n", regs.mq);
-	fprintf(fp, "DAR: %08lx ", regs.dar);
-	fprintf(fp, "DSISR: %08lx ", regs.dsisr);
-	fprintf(fp, "       Syscall Result: %08lx\n", regs.result);
+	fprintf(fp, "LR:  %08lx   ", regs->link);
+	fprintf(fp, "XER: %08lx   ", regs->xer);
+	fprintf(fp, "CCR: %08lx   ", regs->ccr);
+	fprintf(fp, "MQ:  %08lx\n", regs->mq);
+	fprintf(fp, "DAR: %08lx ", regs->dar);
+	fprintf(fp, "DSISR: %08lx ", regs->dsisr);
+	fprintf(fp, "       Syscall Result: %08lx\n", regs->result);
+}
+
+/*
+ * Print the exception frame information
+ */
+static void
+ppc_print_eframe(char *efrm_str, struct ppc_pt_regs *regs, struct bt_info *bt)
+{
+	if (BT_REFERENCE_CHECK(bt))
+		return;
+
+	fprintf(fp, " %s  [%lx] exception frame:", efrm_str, regs->trap);
+	ppc_print_regs(regs);
+	fprintf(fp, "\n");
+}
+
+static void
+ppc_kdump_stack_frame(struct bt_info *bt, ulong *nip, ulong *ksp)
+{
+	struct ppc_pt_regs *pt_regs;
+	unsigned long ip, sp;
+
+	ip = sp = 0;
+
+	pt_regs = (struct ppc_pt_regs*)bt->machdep;
+
+	if (!pt_regs || !(pt_regs->gpr[1])) {
+		fprintf(fp, "0%lx: GPR1 register value(SP) was not saved\n",
+			bt->task);
+		return;
+	}
+
+	sp = pt_regs->gpr[1];
+
+	if (!IS_KVADDR(sp)) {
+		if (IN_TASK_VMA(bt->task, *ksp))
+			fprintf(fp, "%0lx: Task is running in user space\n",
+				bt->task);
+		else 
+			fprintf(fp, "%0lx: Invalid Stack Pointer %0lx\n",
+				bt->task, *ksp);
+	}
+
+	ip = pt_regs->nip;
+
+	if(nip)
+		*nip = ip;
+	if (ksp)
+		*ksp = sp;
+
+	if (bt->flags && 
+		((BT_TEXT_SYMBOLS | BT_TEXT_SYMBOLS_PRINT |
+			BT_TEXT_SYMBOLS_NOPRINT))) 
+		return;
+	/*
+	 * Print the collected regs for the active task
+	 */
+	ppc_print_regs(pt_regs);
+
+	if (!IS_KVADDR(sp)) 
+		return;
+	
+	fprintf(fp, " NIP [%016lx] %s\n", pt_regs->nip,
+		closest_symbol(pt_regs->nip));
+	fprintf(fp, " LR  [%016lx] %s\n", pt_regs->link,
+			closest_symbol(pt_regs->link));
+
+	fprintf(fp, "\n");
+
+	return;
+}	
+	
+static void
+ppc_dumpfile_stack_frame(struct bt_info *bt, ulong *getpc, ulong *getsp)
+{
+	struct syment *sp;
+
+	/* 
+	 * For KDUMP and compressed KDUMP get the SP, PC from pt_regs 
+	 * read from the Elf Note. 
+	 */
+	if (ELF_NOTES_VALID()) {
+		ppc_kdump_stack_frame(bt, getpc, getsp);
+		return;
+	}
+	
+	if (getpc) {
+		if (!(sp = next_symbol("crash_save_current_state", NULL)))
+			*getpc = (symbol_value("crash_save_current_state")+16);
+        	else
+			*getpc = (sp->value - 4);
+	}
 }
 
 /*
@@ -962,58 +1456,26 @@ ppc_exception_frame(ulong addr, struct bt_info *bt, struct gnu_request *req)
 static void
 ppc_get_stack_frame(struct bt_info *bt, ulong *pcp, ulong *spp)
 {
-	if (pcp)
-		*pcp = ppc_get_pc(bt);
-	if (spp)
-		*spp = ppc_get_sp(bt);
-}
+	if (DUMPFILE() && is_task_active(bt->task))
+		ppc_dumpfile_stack_frame(bt, pcp, spp);
+	else
+		get_ppc_frame(bt, pcp, spp);
 
-
-/*
- *  Get the saved ESP from a user-space copy of the kernel stack.
- */
-static ulong
-ppc_get_sp(struct bt_info *bt)
-{
-        ulong sp;
-
-        get_ppc_frame(bt, NULL, &sp);
-
-        return sp;
 }
 
 /*
- *  Get the saved PC from a user-space copy of the kernel stack.
- */
-static ulong
-ppc_get_pc(struct bt_info *bt)
-{
-	struct syment *sp;
-	ulong ip;
-
-	if (DUMPFILE() && is_task_active(bt->task)) {
-		if (!(sp = next_symbol("crash_save_current_state", NULL)))
-			return (symbol_value("crash_save_current_state")+16);
-		else
-			return (sp->value - 4);
-	}
-	get_ppc_frame(bt, &ip, NULL);
-
-	return ip;
-}
-
-/*
- *  Do the work for ppc_get_sp() and ppc_get_pc().
+ *  Do the work for ppc_get_stack_frame() for non-active tasks
  */
 static void
 get_ppc_frame(struct bt_info *bt, ulong *getpc, ulong *getsp)
 {
 	ulong ip;
 	ulong sp;
-	ulong offset;
 	ulong *stack;
 	ulong task;
+	struct ppc_pt_regs regs;
 
+	ip = 0;
 	task = bt->task;
 	stack = (ulong *)bt->stackbuf;
 
@@ -1026,27 +1488,31 @@ get_ppc_frame(struct bt_info *bt, ulong *getpc, ulong *getsp)
 	else 
                 sp = stack[OFFSET(task_struct_thread_ksp)/sizeof(long)];
 
-	/* 
-	 *  get the offset to the first pointer in the stack frame
-	 *  linked list.  here is a small picture:
-	 *
-	 *    ksp            
-	 * >c73e9d30:  c73e9d50 c007efbc 00000000 00000008
-	 *             ^^^^^^^^ = Pointer to first stack frame.
-	 *  c73e9d40:  c0742000 00000000 c02071e0 c73e9d50
-	 * >c73e9d50:  c73e9d80 c0013928 c73e8000 c73e9d60
-	 *             ^^^^^^^^ ^^^^^^^^ Pointer to return function
-	 *                |              (LR save word)
-	 *                 \-----------> Pointer to next stack frame
-	 *  c73e9d60:  c73e9d80 c73e9e10 c01e0000 00000007
-	 *  c73e9d70:  00000000 00000000 7fffffff c73e9d80
-	 */
+	if (!INSTACK(sp, bt))
+		goto out;
 
-	offset = (stack[(sp-task)/sizeof(long)]-task)/sizeof(long);
-
-	sp = stack[offset];
-	ip = stack[(sp - task)/sizeof(long)+1]; 
-
+	readmem(sp + STACK_FRAME_OVERHEAD, KVADDR, &regs,
+		sizeof(struct ppc_pt_regs),
+		"PPC pt_regs", FAULT_ON_ERROR);
+	ip = regs.nip;
+	if (STREQ(closest_symbol(ip), "__switch_to")) {
+		/* NOTE: _switch_to() calls _switch() which
+		 * is asm.  _switch leaves pc == lr.
+		 * Working through this frame is tricky,
+		 * and this mess isn't going to help if we
+		 * actually dumped here.  Most likely the
+		 * analyzer is trying to backtrace a task.
+		 * Need to skip 2 frames.
+		 */
+		sp = stack[(sp - bt->stackbase)/sizeof(ulong)];
+		if (!INSTACK(sp, bt))
+			goto out;
+		sp = stack[(sp - bt->stackbase)/sizeof(ulong)];
+		if (!INSTACK(sp + 4, bt))
+			goto out;
+		ip = stack[(sp + 4 - bt->stackbase)/sizeof(ulong)];
+	}
+out:
 	if (DUMPFILE() && getsp && STREQ(closest_symbol(sp), "panic")) {
 		*getsp = sp;
 		return;
@@ -1064,13 +1530,11 @@ get_ppc_frame(struct bt_info *bt, ulong *getpc, ulong *getsp)
  */
 static void ppc_dump_irq(int irq)
 {
-	struct datatype_member datatype_member, *dm;
         ulong irq_desc_addr, addr;
         int level, others;
         ulong action, ctl, value;
 	char typename[32];
-
-        dm = &datatype_member;
+	int len;
 
         irq_desc_addr = symbol_value("irq_desc") + (SIZE(irqdesc) * irq);
 	
@@ -1097,9 +1561,9 @@ static void ppc_dump_irq(int irq)
 		/* typename */
 		readmem(ctl + OFFSET(hw_interrupt_type_typename), KVADDR, &addr,
 			sizeof(ulong), "typename pointer", FAULT_ON_ERROR);
-		read_string(addr, typename, 32);
+		len = read_string(addr, typename, 32);
 		
-		if(typename)
+		if(len)
 			fprintf(fp, "         typename: %08lx  \"%s\"\n", 
 				addr, typename);
 		
@@ -1211,9 +1675,9 @@ static void ppc_dump_irq(int irq)
 		/* name */
 		readmem(action + OFFSET(irqaction_name), KVADDR, &addr,
 			sizeof(ulong), "action name", FAULT_ON_ERROR);
-		read_string(addr, typename, 32);
+		len = read_string(addr, typename, 32);
 		
-		if(typename)
+		if(len)
 			fprintf(fp, "             name: %08lx  \"%s\"\n", 
 				addr, typename);
 
@@ -1238,7 +1702,7 @@ static void ppc_dump_irq(int irq)
  *  Filter disassembly output if the output radix is not gdb's default 10
  */
 static int 
-ppc_dis_filter(ulong vaddr, char *inbuf)
+ppc_dis_filter(ulong vaddr, char *inbuf, unsigned int output_radix)
 {
         char buf1[BUFSIZE];
         char buf2[BUFSIZE];
@@ -1260,7 +1724,7 @@ ppc_dis_filter(ulong vaddr, char *inbuf)
 
 	if (colon) {
 		sprintf(buf1, "0x%lx <%s>", vaddr,
-			value_to_symstr(vaddr, buf2, pc->output_radix));
+			value_to_symstr(vaddr, buf2, output_radix));
 		sprintf(buf2, "%s%s", buf1, colon);
 		strcpy(inbuf, buf2);
 	}
@@ -1282,9 +1746,9 @@ ppc_dis_filter(ulong vaddr, char *inbuf)
 			return FALSE;
 
 		sprintf(buf1, "0x%lx <%s>\n", value,	
-			value_to_symstr(value, buf2, pc->output_radix));
+			value_to_symstr(value, buf2, output_radix));
 
-		sprintf(p1, buf1);
+		sprintf(p1, "%s", buf1);
 	}
 
 	console("    %s", inbuf);
@@ -1299,7 +1763,7 @@ ppc_dis_filter(ulong vaddr, char *inbuf)
 int
 ppc_get_smp_cpus(void)
 {
-        return kt->cpus;
+	return (get_cpus_online() > 0) ? get_cpus_online() : kt->cpus;
 }
 
 /*
@@ -1331,6 +1795,7 @@ ppc_cmd_mach(void)
 static void
 ppc_display_machine_stats(void)
 {
+	int c;
         struct new_utsname *uts;
         char buf[BUFSIZE];
         ulong mhz;
@@ -1338,6 +1803,7 @@ ppc_display_machine_stats(void)
         uts = &kt->utsname;
 
         fprintf(fp, "       MACHINE TYPE: %s\n", uts->machine);
+        fprintf(fp, "           PLATFORM: %s\n", PPC_PLATFORM);
         fprintf(fp, "        MEMORY SIZE: %s\n", get_memory_size(buf));
         fprintf(fp, "               CPUS: %d\n", kt->cpus);
         fprintf(fp, "    PROCESSOR SPEED: ");
@@ -1347,10 +1813,31 @@ ppc_display_machine_stats(void)
                 fprintf(fp, "(unknown)\n");
         fprintf(fp, "                 HZ: %d\n", machdep->hz);
         fprintf(fp, "          PAGE SIZE: %d\n", PAGESIZE());
-        fprintf(fp, "      L1 CACHE SIZE: %d\n", l1_cache_size());
+//      fprintf(fp, "      L1 CACHE SIZE: %d\n", l1_cache_size());
         fprintf(fp, "KERNEL VIRTUAL BASE: %lx\n", machdep->kvbase);
         fprintf(fp, "KERNEL VMALLOC BASE: %lx\n", vt->vmalloc_start);
         fprintf(fp, "  KERNEL STACK SIZE: %ld\n", STACKSIZE());
+
+	if (tt->flags & IRQSTACKS) {
+		fprintf(fp, "HARD IRQ STACK SIZE: %ld\n", SIZE(irq_ctx));
+		fprintf(fp, "    HARD IRQ STACKS:\n");
+
+		for (c = 0; c < kt->cpus; c++) {
+			if (!tt->hardirq_ctx[c])
+				break;
+			sprintf(buf, "CPU %d", c);
+			fprintf(fp, "%19s: %lx\n", buf, tt->hardirq_ctx[c]);
+		}
+
+		fprintf(fp, "SOFT IRQ STACK SIZE: %ld\n", SIZE(irq_ctx));
+		fprintf(fp, "    SOFT IRQ STACKS:\n");
+		for (c = 0; c < kt->cpus; c++) {
+			if (!tt->softirq_ctx[c])
+				break;
+			sprintf(buf, "CPU %d", c);
+			fprintf(fp, "%19s: %lx\n", buf, tt->softirq_ctx[c]);
+		}
+	}
 }
 
 
@@ -1484,5 +1971,80 @@ try_closest:
                         goto try_closest;
                 }
         }
+}
+
+/*
+ * Try to relocate NT_PRSTATUS notes according by in kernel crash_notes.
+ * Function is only called from ppc's get_regs.
+ */
+static int
+verify_crash_note_in_kernel(int cpu)
+{
+	int ret;
+	Elf32_Nhdr *note32;
+	ulong crash_notes_ptr;
+	char *buf, *name;
+
+	ret = TRUE;
+	if (!readmem(symbol_value("crash_notes"), KVADDR, &crash_notes_ptr,
+		     sizeof(ulong), "crash_notes", QUIET|RETURN_ON_ERROR) ||
+	    !crash_notes_ptr)
+		goto out;
+
+	buf = GETBUF(SIZE(note_buf));
+	if ((kt->flags & SMP) && (kt->flags & PER_CPU_OFF))
+		crash_notes_ptr += kt->__per_cpu_offset[cpu];
+	if (!readmem(crash_notes_ptr, KVADDR, buf, SIZE(note_buf),
+		     "cpu crash_notes", QUIET|RETURN_ON_ERROR))
+		goto freebuf;
+
+	note32 = (Elf32_Nhdr *)buf;
+	name = (char *)(note32 + 1);
+	if (note32->n_type != NT_PRSTATUS ||
+	    note32->n_namesz != strlen("CORE") + 1 ||
+	    strncmp(name, "CORE", note32->n_namesz) ||
+	    note32->n_descsz != SIZE(elf_prstatus))
+		ret = FALSE;
+freebuf:
+	FREEBUF(buf);
+out:
+	return ret;
+}
+
+void
+ppc_relocate_nt_prstatus_percpu(void **nt_prstatus_percpu,
+				uint *num_prstatus_notes)
+{
+	static int relocated = FALSE;
+	void **nt_ptr;
+	int i, j, nrcpus;
+	size_t size;
+
+	/* relocation is possible only once */
+	if (relocated == TRUE)
+		return;
+	relocated = TRUE;
+	if (!symbol_exists("crash_notes") ||
+	    !VALID_STRUCT(note_buf) || !VALID_STRUCT(elf_prstatus))
+		return;
+
+	size = NR_CPUS * sizeof(void *);
+	nt_ptr = (void **)GETBUF(size);
+	BCOPY(nt_prstatus_percpu, nt_ptr, size);
+	BZERO(nt_prstatus_percpu, size);
+
+	*num_prstatus_notes = 0;
+	nrcpus = (kt->kernel_NR_CPUS ? kt->kernel_NR_CPUS : NR_CPUS);
+	for (i = 0, j = 0; i < nrcpus; i++) {
+		if (!in_cpu_map(ONLINE_MAP, i))
+			continue;
+		if (verify_crash_note_in_kernel(i))
+			nt_prstatus_percpu[i] = nt_ptr[j++];
+		else if (CRASHDEBUG(1))
+			error(WARNING, "cpu#%d: crash_notes not saved\n", i);
+		/* num_prstatus_notes is always equal to online cpus in ppc */
+		(*num_prstatus_notes)++;
+	}
+	FREEBUF(nt_ptr);
 }
 #endif /* PPC */

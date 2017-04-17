@@ -1,8 +1,8 @@
 /* gdb_interface.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2015 David Anderson
+ * Copyright (C) 2002-2015 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@
 
 static void exit_after_gdb_info(void);
 static int is_restricted_command(char *, ulong);
+static void strip_redirection(char *);
 int get_frame_offset(ulong);
 
 int *gdb_output_format;
@@ -29,9 +30,7 @@ int *gdb_repeat_count_threshold;
 int *gdb_stop_print_at_null;
 unsigned int *gdb_output_radix;
 
-#ifdef GDB_7_0
-ulong gdb_user_print_option_address(char *);
-#endif
+static ulong gdb_user_print_option_address(char *);
 
 /*
  *  Called from main() this routine sets up the call-back hook such that
@@ -69,43 +68,36 @@ gdb_main_loop(int argc, char **argv)
 	}
 
         optind = 0;
-#if defined(GDB_7_0)
-	deprecated_command_loop_hook = main_loop;
-#else
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1)
         command_loop_hook = main_loop;
-#endif
-#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
-        gdb_main_entry(argc, argv);
 #else
-        gdb_main(argc, argv);
+	deprecated_command_loop_hook = main_loop;
 #endif
+        gdb_main_entry(argc, argv);
 }
 
 /*
  *  Update any hooks that gdb has set.
  */
-#if defined(GDB_6_0) || defined(GDB_6_1)
 void
 update_gdb_hooks(void)
 {
+#if defined(GDB_6_0) || defined(GDB_6_1)
 	command_loop_hook = pc->flags & VERSION_QUERY ?
         	exit_after_gdb_info : main_loop;
 	target_new_objfile_hook = NULL;
-}
 #endif
-#if defined(GDB_7_0)
-void
-update_gdb_hooks(void)
-{
+#if defined(GDB_7_0) || defined(GDB_7_3_1) || defined(GDB_7_6)
 	deprecated_command_loop_hook = pc->flags & VERSION_QUERY ?
 		exit_after_gdb_info : main_loop;
-}
 #endif
+}
 
 void
 gdb_readnow_warning(void)
 {
-	if ((THIS_GCC_VERSION >= GCC(3,4,0)) && !(pc->flags & READNOW)) {
+	if ((THIS_GCC_VERSION >= GCC(3,4,0)) && (THIS_GCC_VERSION < GCC(4,0,0))
+	    && !(pc->flags & READNOW)) {
 		fprintf(stderr, 
  "WARNING: Because this kernel was compiled with gcc version %d.%d.%d, certain\n" 
  "         commands or command options may fail unless crash is invoked with\n"
@@ -125,17 +117,14 @@ void
 display_gdb_banner(void)
 {
 	optind = 0;
-#if defined(GDB_7_0)
-        deprecated_command_loop_hook = exit_after_gdb_info;
-#else
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1)
         command_loop_hook = exit_after_gdb_info;
+#else
+        deprecated_command_loop_hook = exit_after_gdb_info;
 #endif
 	args[0] = "gdb";
-#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
-        gdb_main_entry(1, args);
-#else
-        gdb_main(1, args);
-#endif
+	args[1] = "-version";
+	gdb_main_entry(2, args);
 }
 
 static void
@@ -184,7 +173,15 @@ gdb_session_init(void)
 	/*
 	 *  Set up pointers to gdb variables.
 	 */
-#if defined(GDB_7_0)
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1)
+	gdb_output_format = &output_format;
+	gdb_print_max = &print_max;
+	gdb_prettyprint_structs = &prettyprint_structs;
+	gdb_prettyprint_arrays = &prettyprint_arrays;
+	gdb_repeat_count_threshold = &repeat_count_threshold;
+	gdb_stop_print_at_null = &stop_print_at_null;
+	gdb_output_radix = &output_radix;
+#else
 	gdb_output_format = (int *) 
 		gdb_user_print_option_address("output_format");
 	gdb_print_max = (unsigned int *)
@@ -199,18 +196,11 @@ gdb_session_init(void)
 		gdb_user_print_option_address("stop_print_at_null");
 	gdb_output_radix = (unsigned int *)
 		gdb_user_print_option_address("output_radix");
-#else
-	gdb_output_format = &output_format;
-	gdb_print_max = &print_max;
-	gdb_prettyprint_structs = &prettyprint_structs;
-	gdb_prettyprint_arrays = &prettyprint_arrays;
-	gdb_repeat_count_threshold = &repeat_count_threshold;
-	gdb_stop_print_at_null = &stop_print_at_null;
-	gdb_output_radix = &output_radix;
 #endif
 	/*
-         *  If the output radix is set in an .rc file, then pc->output_radix
-         *  will be non-zero.  Otherwise use the gdb default.
+         *  If the output radix is set via the --hex or --dec command line
+	 *  option, then pc->output_radix will be non-zero; otherwise use 
+	 *  the gdb default.  
 	 */
 	if (pc->output_radix) {  
 		*gdb_output_radix = pc->output_radix;
@@ -231,7 +221,7 @@ gdb_session_init(void)
 	*gdb_prettyprint_structs = 1;
 	*gdb_repeat_count_threshold = 0x7fffffff;
 	*gdb_print_max = 256;
-#if !defined(GDB_6_0) && !defined(GDB_6_1) && !defined(GDB_7_0)
+#ifdef GDB_5_3
 	gdb_disassemble_from_exec = 0;
 #endif
 
@@ -367,8 +357,8 @@ gdb_interface(struct gnu_request *req)
 		restart(0);
 
 	if (!req->fp) {
-		req->fp = pc->flags & RUNTIME ? fp : 
-			  CRASHDEBUG(1) ? fp : pc->nullfp;
+		req->fp = ((pc->flags & RUNTIME) || (pc->flags2 & ALLOW_FP)) ? 
+			fp : CRASHDEBUG(1) ? fp : pc->nullfp;
 	}
 
 	pc->cur_req = req;
@@ -495,6 +485,8 @@ dump_gnu_request(struct gnu_request *req, int in_gdb)
                 console("%sGNU_FROM_TTY_OFF", others++ ? "|" : "");
         if (req->flags & GNU_NO_READMEM)
                 console("%sGNU_NO_READMEM", others++ ? "|" : "");
+        if (req->flags & GNU_VAR_LENGTH_TYPECODE)
+                console("%sGNU_VAR_LENGTH_TYPECODE", others++ ? "|" : "");
 	console(")\n");
 
         console("addr: %lx ", req->addr);
@@ -507,7 +499,11 @@ dump_gnu_request(struct gnu_request *req, int in_gdb)
 		console("name: %lx ", (ulong)req->name);
 	console("length: %ld ", req->length);
         console("typecode: %d\n", req->typecode);
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
 	console("typename: %s\n", req->typename);
+#else
+	console("type_name: %s\n", req->type_name);
+#endif
 	console("target_typename: %s\n", req->target_typename);
 	console("target_length: %ld ", req->target_length);
 	console("target_typecode: %d ", req->target_typecode);
@@ -590,7 +586,15 @@ gdb_command_string(int cmd, char *buf, int live)
         case GNU_PATCH_SYMBOL_VALUES:
                 sprintf(buf, "GNU_PATCH_SYMBOL_VALUES");
                 break;
-
+        case GNU_USER_PRINT_OPTION:
+                sprintf(buf, "GNU_USER_PRINT_OPTION");
+		break;
+        case GNU_SET_CRASH_BLOCK:
+                sprintf(buf, "GNU_SET_CRASH_BLOCK");
+		break;
+	case GNU_GET_FUNCTION_RANGE:
+                sprintf(buf, "GNU_GET_FUNCTION_RANGE");
+                break;
 	case 0:
 		buf[0] = NULLCHAR;
 		break;
@@ -738,40 +742,63 @@ is_restricted_command(char *cmd, ulong flags)
 }
 
 /*
+ *  Remove pipe/redirection stuff from the end of the command line.
+ */ 
+static void
+strip_redirection(char *buf)
+{
+	char *p1, *p2;
+
+	p1 = strstr_rightmost(buf, args[argcnt-1]);
+	p2 = p1 + strlen(args[argcnt-1]);
+	console("strip_redirection: [%s]\n", p2);
+
+	if ((p1 = strpbrk(p2, "|!>")))
+		*p1 = NULLCHAR;
+
+	strip_ending_whitespace(buf);
+}
+
+/*
  *  Command for passing strings directly to gdb.
  */
 void
 cmd_gdb(void)
 {
-        int c;
 	char buf[BUFSIZE];
+        char **argv;
 
-        while ((c = getopt(argcnt, args, "")) != EOF) {
-                switch(c)
-                {
-                default:
-                        argerrs++;
-                        break;
-                }
-        }
+	argv = STREQ(args[0], "gdb") ? &args[1] : &args[0];
 
-        if (argerrs || !args[optind])
+        if (*argv == NULL)
                 cmd_usage(pc->curcmd, SYNOPSIS);
 
-	/*
-	 *  Intercept set commands in case something has to be done here.
-	 */ 
-	if (STREQ(args[1], "set")) {
-		if (args[2] && args[3] && STREQ(args[2], "output-radix")) {
-			pc->output_radix = stol(args[3], FAULT_ON_ERROR, NULL);
-		}
-	}
+        if (STREQ(*argv, "set") && argv[1]) {
+                /*
+                 *  Intercept set commands in case something has to be done
+		 *  here or elsewhere.
+                 */ 
+                if (STREQ(argv[1], "gdb")) {
+                        cmd_set();
+                        return;
+                }
+                if (STREQ(argv[1], "output-radix") && argv[2])
+                        pc->output_radix = stol(argv[2], FAULT_ON_ERROR, NULL);
+        }
 
 	/*
 	 *  If the command is not restricted, pass it on.
 	 */
-	if (!is_restricted_command(args[1], FAULT_ON_ERROR)) {
-		concat_args(buf, 1, 0);
+	if (!is_restricted_command(*argv, FAULT_ON_ERROR)) {
+		if (STREQ(pc->command_line, "gdb")) {
+			strcpy(buf, first_space(pc->orig_line));
+			strip_beginning_whitespace(buf);
+		} else
+			strcpy(buf, pc->orig_line);
+
+		if (pc->redirect & (REDIRECT_TO_FILE|REDIRECT_TO_PIPE))
+			strip_redirection(buf);
+
 		if (!gdb_pass_through(buf, NULL, GNU_RETURN_ON_ERROR))
 			error(INFO, "gdb request failed: %s\n", buf);
 	}
@@ -788,12 +815,16 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 	char locbuf[SIZEOF_32BIT], *p1;
 	uint32_t *p2;
 	int memtype;
+	ulong readflags;
 
 	if (write)
 		return FALSE;
 
 	if (pc->cur_req->flags & GNU_NO_READMEM)
 		return TRUE;
+
+	readflags = pc->curcmd_flags & PARTIAL_READ_OK ?
+		RETURN_ON_ERROR|RETURN_PARTIAL : RETURN_ON_ERROR;
 
 	if (pc->curcmd_flags & MEMTYPE_UVADDR)
 		memtype = UVADDR;
@@ -818,7 +849,7 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 
 	if (memtype == FILEADDR)
 		return(readmem(pc->curcmd_private, memtype, buf, len,
-                	"gdb_readmem_callback", RETURN_ON_ERROR));
+			"gdb_readmem_callback", readflags));
 	
 	switch (len)
 	{
@@ -828,31 +859,58 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 		    text_value_cache_byte(addr, (unsigned char *)p1)) 
 			return TRUE;
 
-		if (readmem(addr, memtype, locbuf, SIZEOF_32BIT,
-                    "gdb_readmem_callback", RETURN_ON_ERROR)) {
-			*p1 = locbuf[0];
+		if (!readmem(addr, memtype, locbuf, SIZEOF_32BIT,
+		    "gdb_readmem_callback", readflags)) 
+			return FALSE;
+
+		*p1 = locbuf[0];
+		if (memtype == KVADDR) {
 			p2 = (uint32_t *)locbuf;
 			text_value_cache(addr, *p2, 0);
-			return TRUE;
 		}
-		break;
+		return TRUE;
 
 	case SIZEOF_32BIT:
-                if ((memtype == KVADDR) && text_value_cache(addr, 0, buf)) 
+		if ((memtype == KVADDR) && text_value_cache(addr, 0, buf)) 
 			return TRUE;
 
-		if (readmem(addr, memtype, buf, SIZEOF_32BIT, 
-		    "gdb_readmem callback", FAULT_ON_ERROR)) {
-                       	text_value_cache(addr, 
+		if (!readmem(addr, memtype, buf, SIZEOF_32BIT, 
+		    "gdb_readmem callback", readflags))
+			return FALSE;
+
+		if (memtype == KVADDR)
+			text_value_cache(addr, 
 				(uint32_t)*((uint32_t *)buf), NULL);
-			return TRUE;
-                }
-		break;
+		return TRUE;
 	}
 
-	return(readmem(addr, memtype, buf, len,
-                "gdb_readmem_callback", RETURN_ON_ERROR));
+	return(readmem(addr, memtype, buf, len, 
+		"gdb_readmem_callback", readflags));
+}
 
+/*
+ *  Machine-specific line-number pc section range verifier.
+ */
+int
+gdb_line_number_callback(ulong pc, ulong low, ulong high)
+{
+	if (machdep->verify_line_number)
+		return machdep->verify_line_number(pc, low, high);
+
+	return TRUE;
+}
+
+/*
+ *  Prevent gdb from trying to translate and print pointers
+ *  that are not kernel virtual addresses.  
+ */
+int
+gdb_print_callback(ulong addr)
+{
+	if (!addr)
+		return FALSE;
+	else
+		return IS_KVADDR(addr);
 }
 
 /*
@@ -879,7 +937,11 @@ gdb_error_hook(void)
 			gdb_command_string(pc->cur_gdb_cmd, buf1, TRUE), buf2);
 	}
 
+#ifdef GDB_7_6
+	do_cleanups(all_cleanups()); 
+#else
 	do_cleanups(NULL); 
+#endif
 
 	longjmp(pc->gdb_interface_env, 1);
 }
@@ -897,8 +959,7 @@ gdb_CRASHDEBUG(ulong dval)
 	return (pc->cur_req && (pc->cur_req->debug >= dval));
 }
 
-#ifdef GDB_7_0
-ulong 
+static ulong 
 gdb_user_print_option_address(char *name)
 {
         struct gnu_request request;
@@ -908,7 +969,54 @@ gdb_user_print_option_address(char *name)
 	gdb_command_funnel(&request);    
 	return request.addr;
 }
-#endif
+
+/*
+ *  Try to set a crash scope block based upon the vaddr.   
+ */
+int
+gdb_set_crash_scope(ulong vaddr, char *arg)
+{
+        struct gnu_request request, *req = &request;
+	char name[BUFSIZE];
+	struct load_module *lm;
+
+	if (!is_kernel_text(vaddr)) {
+		error(INFO, "invalid text address: %s\n", arg);
+		return FALSE;
+	}
+
+	if (module_symbol(vaddr, NULL, &lm, name, 0)) {
+		if (!(lm->mod_flags & MOD_LOAD_SYMS)) {
+			error(INFO, "attempting to find/load \"%s\" module debuginfo\n", 
+				lm->mod_name);
+			if (!load_module_symbols_helper(lm->mod_name)) {
+				error(INFO, "cannot find/load \"%s\" module debuginfo\n", 
+					lm->mod_name);
+				return FALSE;
+			}
+		}
+	}
+
+	req->command = GNU_SET_CRASH_BLOCK;
+	req->addr = vaddr;
+	req->flags = 0;
+	req->addr2 = 0;
+	gdb_command_funnel(req);    
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, 
+		    "gdb_set_crash_scope: %s  addr: %lx  block: %lx\n",
+			req->flags & GNU_COMMAND_FAILED ? "FAILED" : "OK",  
+			req->addr, req->addr2);
+
+	if (req->flags & GNU_COMMAND_FAILED) {
+		error(INFO, 
+			"gdb cannot find text block for address: %s\n", arg);
+		return FALSE;
+	}
+
+	return TRUE;
+}
 
 #ifndef ALPHA
 /*

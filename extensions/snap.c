@@ -1,7 +1,7 @@
 /* snap.c - capture live memory into a kdump or netdump dumpfile
  *
- * Copyright (C) 2009 David Anderson
- * Copyright (C) 2009 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2009, 2013 David Anderson
+ * Copyright (C) 2009, 2013 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,8 +19,8 @@
 #include <linux/types.h>
 #include <elf.h>
 
-int _init(void);
-int _fini(void);
+void snap_init(void);
+void snap_fini(void);
 
 void cmd_snap(void);     
 char *help_snap[];
@@ -35,23 +35,21 @@ static int verify_paddr(physaddr_t);
 static void init_ram_segments(void);
 static int print_progress(const char *, ulong);
 
-#if defined(X86) || defined(X86_64) || defined(IA64) || defined(PPC64)
+#if defined(X86) || defined(X86_64) || defined(IA64) || defined(PPC64) || defined(ARM64)
 int supported = TRUE;
 #else
 int supported = FALSE;
 #endif
 
-int 
-_init(void) /* Register the command set. */
+void __attribute__((constructor)) 
+snap_init(void) /* Register the command set. */
 { 
         register_extension(command_table);
-	return 1;
 }
  
-int 
-_fini(void) 
+void __attribute__((destructor))
+snap_fini(void) 
 { 
-	return 1;
 }
 
 
@@ -356,11 +354,36 @@ struct elf_prstatus_ia64 {
         __u32 pr_fpvalid;         	  /* True if math co-processor being used.  */
 };
 
+/*
+ *  arm64 specific
+ */
+
+struct user_pt_regs_arm64 {
+        __u64           regs[31];
+        __u64           sp;
+        __u64           pc;
+        __u64           pstate;
+};
+
+#define ELF_NGREG_ARM64 (sizeof (struct user_pt_regs_arm64) / sizeof(elf_greg_t))
+#ifndef elf_greg_t
+typedef unsigned long elf_greg_t;
+#endif
+typedef elf_greg_t elf_gregset_arm64_t[ELF_NGREG_ARM64];
+
+struct elf_prstatus_arm64 {
+        char pad[112];
+	elf_gregset_arm64_t pr_reg;
+	int pr_fpvalid;
+};
+
+
 union prstatus {
 	struct elf_prstatus_i386 x86; 
 	struct elf_prstatus_x86_64 x86_64; 
 	struct elf_prstatus_ppc64 ppc64;
 	struct elf_prstatus_ia64 ia64;
+	struct elf_prstatus_arm64 arm64;
 };
 
 static size_t
@@ -418,7 +441,11 @@ generate_elf_header(int type, int fd, char *filename)
 	} else if (machine_type("PPC64")) {
 		e_machine = EM_PPC64;
 		prstatus_len = sizeof(prstatus.ppc64);
-	}
+	} else if (machine_type("ARM64")) {
+		e_machine = EM_AARCH64;
+		prstatus_len = sizeof(prstatus.arm64);
+	} else
+		return NULL;
 
 	/* should be enought for the notes + roundup + two blocks */
 	buffer = (char *)GETBUF(sizeof(Elf64_Ehdr) +
@@ -538,9 +565,19 @@ generate_elf_header(int type, int fd, char *filename)
 			load[i].p_flags = PF_R | PF_W | PF_X;
 			load[i].p_align = (type == NETDUMP_ELF64) ? PAGESIZE() : 0;
 			break;
+
+		case EM_AARCH64:
+			nt = &vt->node_table[n++];
+			load[i].p_vaddr = PTOV(nt->start_paddr);
+			load[i].p_paddr = nt->start_paddr;
+			load[i].p_filesz = nt->size * PAGESIZE();
+			load[i].p_memsz = load[i].p_filesz;
+			load[i].p_flags = PF_R | PF_W | PF_X;
+			load[i].p_align = (type == NETDUMP_ELF64) ? PAGESIZE() : 0;
+			break;
 		}
 
-		l_offset += load[i].p_filesz;
+//		l_offset += load[i].p_filesz;
 		offset += sizeof(Elf64_Phdr);
 		ptr += sizeof(Elf64_Phdr);
 	}
@@ -570,7 +607,7 @@ generate_elf_header(int type, int fd, char *filename)
 
   	/* NT_TASKSTRUCT note */
 	task_struct = CURRENT_TASK();
-	len = dump_elf_note (ptr, NT_TASKSTRUCT, "CORE",
+	len = dump_elf_note (ptr, NT_TASKSTRUCT, "SNAP",
 		(char *)&task_struct, sizeof(ulonglong));
 	offset += len;
 	ptr += len;
@@ -725,6 +762,7 @@ print_progress(const char *filename, ulong current)
 	struct node_table *nt;
         static time_t last_time = 0;
 	static ulong total_pages = 0;
+	static ulong written_pages = 0;
 
 	if (!total_pages) {
         	for (n = 0; n < vt->numnodes; n++) {
@@ -738,12 +776,12 @@ print_progress(const char *filename, ulong current)
 		return FALSE;
 	}
 
-        if (current < total_pages) {
+        if (++written_pages < total_pages) {
                 tm = time(NULL);
                 if (tm - last_time < 1)
                         return TRUE;
                 last_time = tm;
-                progress = current * 100 / total_pages;
+                progress = written_pages * 100 / total_pages;
         } else
                 progress = 100;
 

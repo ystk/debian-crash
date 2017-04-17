@@ -1,8 +1,8 @@
 /* symbols.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2016 David Anderson
+ * Copyright (C) 2002-2016 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,23 +17,32 @@
 
 #include "defs.h"
 #include <elf.h>
+#ifdef GDB_7_6
+#define __CONFIG_H__ 1
+#include "config.h"
+#endif
 #include "bfd.h"
 
 static void store_symbols(bfd *, int, void *, long, unsigned int);
 static void store_sysmap_symbols(void);
 static ulong relocate(ulong, char *, int);
 static int relocate_force(ulong, char *);
+static void kaslr_init(void);
+static ulong symbol_value_from_proc_kallsyms(char *);
 static void strip_module_symbol_end(char *s);
 static int compare_syms(const void *, const void *);
 static int compare_mods(const void *, const void *);
 static int compare_prios(const void *v1, const void *v2);
+static int compare_size_name(const void *, const void *);
+struct type_request;
+static void append_struct_symbol (struct type_request *, struct gnu_request *);
+static void request_types(ulong, ulong, char *);
 static asection *get_kernel_section(char *);
 static char * get_section(ulong vaddr, char *buf);
 static void symbol_dump(ulong, char *);
 static void check_for_dups(struct load_module *);
-static int symbol_name_count(char *);
-static struct syment *symbol_search_next(char *, struct syment *);
 static struct syment *kallsyms_module_symbol(struct load_module *, symbol_info *);
+static int kallsyms_module_function_size(struct syment *, struct load_module *, ulong *);
 static void store_load_module_symbols \
 	(bfd *, int, void *, long, uint, ulong, char *);
 static int load_module_index(struct syment *);
@@ -46,15 +55,13 @@ static void check_insmod_builtin(struct load_module *, int, ulong *);
 static int is_insmod_builtin(struct load_module *, struct syment *);
 struct load_module;
 static int add_symbol_file(struct load_module *);
-#ifdef GDB_7_0
 static int add_symbol_file_kallsyms(struct load_module *, struct gnu_request *);
-#endif
 static void find_mod_etext(struct load_module *); 
 static long rodata_search(ulong *, ulong);
 static int ascii_long(ulong word);
 static int is_bfd_format(char *); 
 static int is_binary_stripped(char *);
-static int namespace_ctl(int, struct namespace *, void *, void *);
+static int namespace_ctl(int, struct symbol_namespace *, void *, void *);
 static void symval_hash_init(void);
 static struct syment *symval_hash_search(ulong);
 static void symname_hash_init(void);
@@ -71,8 +78,16 @@ struct elf_common;
 static void Elf32_Sym_to_common(Elf32_Sym *, struct elf_common *); 
 static void Elf64_Sym_to_common(Elf64_Sym *, struct elf_common *); 
 static void cmd_datatype_common(ulong);
-static int display_per_cpu_info(struct syment *);
-
+static void do_datatype_addr(struct datatype_member *, ulong, int,
+			     ulong, char **, int);
+static void process_gdb_output(char *, unsigned, const char *, int);
+static char *expr_type_name(const char *);
+static int display_per_cpu_info(struct syment *, int, char *);
+static struct load_module *get_module_percpu_sym_owner(struct syment *);
+static int is_percpu_symbol(struct syment *);
+static void dump_percpu_symbols(struct load_module *);
+static void print_struct_with_dereference(ulong, struct datatype_member *, ulong);
+static int dereference_pointer(ulong, struct datatype_member *, ulong);
 
 #define KERNEL_SECTIONS  (void *)(1)
 #define MODULE_SECTIONS  (void *)(2) 
@@ -84,6 +99,11 @@ static int display_per_cpu_info(struct syment *);
 #define PARSE_FOR_DECLARATION (2)
 static void parse_for_member(struct datatype_member *, ulong);
 static int show_member_offset(FILE *, struct datatype_member *, char *);
+struct struct_elem;
+static void free_structure(struct struct_elem *);
+static unsigned char is_right_brace(const char *);
+static struct struct_elem *find_node(struct struct_elem *, char *);
+static void dump_node(struct struct_elem *, char *, unsigned char, unsigned char);
 
 
 /*
@@ -110,23 +130,25 @@ static int show_member_offset(FILE *, struct datatype_member *, char *);
 #define IN_UNION       (0x20000)
 #define IN_STRUCT      (0x40000)
 #define DATATYPE_QUERY (0x80000)
+#define ANON_MEMBER_QUERY (0x100000)
+#define SHOW_RAW_DATA     (0x200000)
+#define DEREF_POINTERS    (0x400000)
 
 #define INTEGER_TYPE    (UINT8|INT8|UINT16|INT16|UINT32|INT32|UINT64|INT64)
 
 #define INITIAL_INDENT  (4)
 #define INDENT_INCR     (2)
 
-static int is_typedef(char *);
-static void whatis_datatype(char *, ulong);
+static void whatis_datatype(char *, ulong, FILE *);
 static void whatis_variable(struct syment *);
 static void print_struct(char *, ulong);
 static void print_union(char *, ulong);
 static void dump_datatype_member(FILE *, struct datatype_member *);
 static void dump_datatype_flags(ulong, FILE *);
-static void dump_enumerator_list(char *);
 static long anon_member_offset(char *, char *);
 static int gdb_whatis(char *);
 static void do_datatype_declaration(struct datatype_member *, ulong);
+static int member_to_datatype(char *, struct datatype_member *, ulong);
 
 #define DEBUGINFO_ERROR_MESSAGE1 \
 "the use of a System.map file requires that the accompanying namelist\nargument is a kernel file built with the -g CFLAG.  The namelist argument\nsupplied in this case is a debuginfo file, which must be accompanied by the\nkernel file from which it was derived.\n"
@@ -188,22 +210,6 @@ symtab_init(void)
 			no_debugging_data(FATAL);
 	}
 	
-	symcount = bfd_read_minisymbols(st->bfd, FALSE, &minisyms, &size);
-
-	if (symcount <= 0)
-		no_debugging_data(FATAL);
-	
-	sort_x = bfd_make_empty_symbol(st->bfd);
-	sort_y = bfd_make_empty_symbol(st->bfd);
-	if (sort_x == NULL || sort_y == NULL)
-		error(FATAL, "bfd_make_empty_symbol() failed\n");
-	
-	gnu_qsort(st->bfd, minisyms, symcount, size, sort_x, sort_y);
-	
-	store_symbols(st->bfd, FALSE, minisyms, symcount, size);
-	
-	free(minisyms);
-
 	/*
 	 *  Gather references to the kernel sections.
 	 */
@@ -212,6 +218,7 @@ symtab_init(void)
                 error(FATAL, "symbol table section array malloc: %s\n",
                         strerror(errno));
 	BZERO(st->sections, st->bfd->section_count * sizeof(struct sec *));
+	st->first_section_start = st->last_section_end = 0;
 
 	bfd_map_over_sections(st->bfd, section_header_info, KERNEL_SECTIONS);
 	if ((st->flags & (NO_SEC_LOAD|NO_SEC_CONTENTS)) ==
@@ -222,6 +229,24 @@ symtab_init(void)
 			error(FATAL, DEBUGINFO_ERROR_MESSAGE2);
 		}
 	}
+
+	symcount = bfd_read_minisymbols(st->bfd, FALSE, &minisyms, &size);
+
+	if (symcount <= 0)
+		no_debugging_data(FATAL);
+
+	sort_x = bfd_make_empty_symbol(st->bfd);
+	sort_y = bfd_make_empty_symbol(st->bfd);
+	if (sort_x == NULL || sort_y == NULL)
+		error(FATAL, "bfd_make_empty_symbol() failed\n");
+
+	kaslr_init();
+
+	gnu_qsort(st->bfd, minisyms, symcount, size, sort_x, sort_y);
+
+	store_symbols(st->bfd, FALSE, minisyms, symcount, size);
+
+	free(minisyms);
 
 	symname_hash_init();
 	symval_hash_init();
@@ -244,7 +269,6 @@ check_gnu_debuglink(bfd *bfd)
 	int crc_offset;	
 	unsigned long crc32;
 	char *dirname;
-	char *filename;
 	char *namelist_debug;
         char **matching;
 
@@ -277,7 +301,6 @@ check_gnu_debuglink(bfd *bfd)
 		error(FATAL, "debuginfo file name malloc: %s\n", 
 			strerror(errno));
 
-	filename = basename(pc->namelist);
 	dirname = GETBUF(strlen(pc->namelist)+1);
 	strcpy(dirname, pc->namelist);
 
@@ -417,13 +440,16 @@ separate_debug_file_exists(const char *name, unsigned long crc, int *exists)
 
 	*exists = TRUE;
   	while ((count = read(fd, buffer, sizeof(buffer))) > 0)
-#if defined(GDB_5_3)
+#ifdef GDB_5_3
     		file_crc = calc_crc32(file_crc, buffer, count);
-#elif defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
-    		file_crc = gnu_debuglink_crc32(file_crc, 
+#else
+#ifdef GDB_7_6
+    		file_crc = bfd_calc_gnu_debuglink_crc32(file_crc, 
 			(unsigned char *)buffer, count);
 #else
-		file_crc = 0xdeadbeef;  /* can't get here */
+    		file_crc = gnu_debuglink_crc32(file_crc, 
+			(unsigned char *)buffer, count);
+#endif
 #endif
 
   	close (fd);
@@ -484,13 +510,16 @@ no_debugging_data(int error_type)
 void
 get_text_init_space(void)
 {
-	asection *section;
+	asection *section = NULL;
 
 	if (pc->flags & SYSMAP)
 		return;
 
-	if (((section = get_kernel_section(".text.init")) == NULL) &&
-	    ((section = get_kernel_section(".init.text")) == NULL)) {
+	if (machine_type("ARM"))
+		section = get_kernel_section(".init");
+	if (!section && !(section = get_kernel_section(".text.init")))
+		section = get_kernel_section(".init.text");
+	if (!section) {
 		error(WARNING, "cannot determine text init space\n");
 		return;
 	}
@@ -502,6 +531,144 @@ get_text_init_space(void)
 	if (kt->relocate) {
 		kt->stext_init -= kt->relocate;
 		kt->etext_init -= kt->relocate;
+	}
+}
+
+/*
+ *  Strip gcc-generated cloned text symbol name endings.
+ */
+static char *
+strip_symbol_end(const char *name, char *buf)
+{
+	char *p;
+
+	if (st->flags & NO_STRIP)
+		return (char *)name;
+
+	if ((p = strstr(name, ".isra."))) {
+		if (buf) {
+			strcpy(buf, name);
+			buf[p-name] = NULLCHAR;
+			return buf;
+		} else {
+			*p = NULLCHAR;
+			return (char *)name;
+		}
+	}
+
+	if ((p = strstr(name, ".part."))) {
+		if (buf) {
+			strcpy(buf, name);
+			buf[p-name] = NULLCHAR;
+			return buf;
+		} else {
+			*p = NULLCHAR;
+			return (char *)name;
+		}
+	}
+
+	return (char *)name;
+}
+
+/*
+ *  Gather the relevant information from the dumpfile or live system
+ *  and determine whether to derive the KASLR offset.
+ *
+ *  Setting st->_stext_vmlinux to UNINITIALIZED will trigger the
+ *  search for "_stext" from the vmlinux file during the initial
+ *  symbol sort operation.
+ *
+ *  Setting RELOC_AUTO will ensure that derive_kaslr_offset() is
+ *  called after the sorting operation has captured the vmlinux
+ *  file's "_stext" symbol value -- which it will compare to the 
+ *  relocated "_stext" value found in either a dumpfile's vmcoreinfo
+ *  or in /proc/kallsyms on a live system.
+ *
+ *  Setting KASLR_CHECK will trigger a search for "module_load_offset"
+ *  during the initial symbol sort operation, and if found, will
+ *  set (RELOC_AUTO|KASLR).  On live systems, the search is done
+ *  here by checking /proc/kallsyms.
+ */
+static void
+kaslr_init(void)
+{
+	char *string;
+
+	if ((!machine_type("X86_64") && !machine_type("ARM64")) ||
+	    (kt->flags & RELOC_SET))
+		return;
+
+	/*
+	 *  --kaslr=auto
+	 */
+	if ((kt->flags2 & (RELOC_AUTO|KASLR)) == (RELOC_AUTO|KASLR))
+		st->_stext_vmlinux = UNINITIALIZED;
+
+	if (ACTIVE() &&   /* Linux 3.15 */
+	    (symbol_value_from_proc_kallsyms("module_load_offset") != BADVAL)) {
+		kt->flags2 |= (RELOC_AUTO|KASLR);
+		st->_stext_vmlinux = UNINITIALIZED;
+	}
+
+	if (KDUMP_DUMPFILE() || DISKDUMP_DUMPFILE()) {
+		if ((string = pc->read_vmcoreinfo("SYMBOL(_stext)"))) {
+			kt->vmcoreinfo._stext_SYMBOL =
+				htol(string, RETURN_ON_ERROR, NULL);
+			free(string);
+		}
+
+		/* Linux 3.14 */
+		if ((string = pc->read_vmcoreinfo("KERNELOFFSET"))) {
+			free(string);
+			kt->flags2 |= KASLR_CHECK;
+			st->_stext_vmlinux = UNINITIALIZED;
+		}
+	}
+}
+
+/*
+ * Derives the kernel aslr offset by comparing the _stext symbol from the
+ * the vmcoreinfo in the dump file to the _stext symbol in the vmlinux file.
+ */
+static void
+derive_kaslr_offset(bfd *abfd, int dynamic, bfd_byte *start, bfd_byte *end,
+		    unsigned int size, asymbol *store)
+{
+	unsigned long relocate;
+	ulong _stext_relocated;
+
+	if (ACTIVE()) {
+		_stext_relocated = symbol_value_from_proc_kallsyms("_stext");
+		if (_stext_relocated == BADVAL)
+			return;
+	} else {
+		_stext_relocated = kt->vmcoreinfo._stext_SYMBOL;
+		if (_stext_relocated == 0)
+			return;
+	}
+
+	/*
+	 * To avoid mistaking an mismatched kernel version with
+	 * a kaslr offset, we make sure that the offset is
+	 * aligned by 0x1000, as it always will be for kaslr.
+	 */
+	if (st->_stext_vmlinux && (st->_stext_vmlinux != UNINITIALIZED)) {
+		relocate = st->_stext_vmlinux - _stext_relocated;
+		if (relocate && !(relocate & 0xfff)) {
+			kt->relocate = relocate;
+			kt->flags |= RELOC_SET;
+		}
+	}
+
+	if (CRASHDEBUG(1) && (kt->flags & RELOC_SET)) {
+		fprintf(fp, "KASLR:\n");
+		fprintf(fp, "  _stext from %s: %lx\n", 
+			basename(pc->namelist), st->_stext_vmlinux);
+		fprintf(fp, "  _stext from %s: %lx\n",
+			ACTIVE() ? "/proc/kallsyms" : "vmcoreinfo",
+			_stext_relocated);
+		fprintf(fp, "  relocate: %lx (%ldMB)\n",
+			kt->relocate * -1, (kt->relocate * -1) >> 20);
 	}
 }
 
@@ -518,6 +685,8 @@ store_symbols(bfd *abfd, int dynamic, void *minisyms, long symcount,
   	bfd_byte *from, *fromend;
         symbol_info syminfo;
 	struct syment *sp;
+	char buf[BUFSIZE];
+	char *name;
 	int first;
 
   	if ((store = bfd_make_empty_symbol(abfd)) == NULL)
@@ -528,7 +697,7 @@ store_symbols(bfd *abfd, int dynamic, void *minisyms, long symcount,
 		error(FATAL, "symbol table syment space malloc: %s\n",
 			strerror(errno));
 
-	if (!namespace_ctl(NAMESPACE_INIT, &st->namespace, 
+	if (!namespace_ctl(NAMESPACE_INIT, &st->kernel_namespace, 
 	    (void *)symcount, NULL))
 		error(FATAL, "symbol table namespace malloc: %s\n", 
 			strerror(errno));
@@ -538,15 +707,20 @@ store_symbols(bfd *abfd, int dynamic, void *minisyms, long symcount,
 	st->symcnt = 0;
 	sp = st->symtable;
 
+	first = 0;
+	from = (bfd_byte *) minisyms;
+	fromend = from + symcount * size;
+
 	if (machine_type("X86")) {
 		if (!(kt->flags & RELOC_SET))
 			kt->flags |= RELOC_FORCE;
+	} else if (machine_type("X86_64") || machine_type("ARM64")) {
+		if ((kt->flags2 & RELOC_AUTO) && !(kt->flags & RELOC_SET))
+			derive_kaslr_offset(abfd, dynamic, from,
+				fromend, size, store);
 	} else
 		kt->flags &= ~RELOC_SET;
 
-	first = 0;
-  	from = (bfd_byte *) minisyms;
-  	fromend = from + symcount * size;
   	for (; from < fromend; from += size)
     	{
       		if ((sym = bfd_minisymbol_to_symbol(abfd, dynamic, from, store))
@@ -554,7 +728,9 @@ store_symbols(bfd *abfd, int dynamic, void *minisyms, long symcount,
 			error(FATAL, "bfd_minisymbol_to_symbol() failed\n");
 
       		bfd_get_symbol_info(abfd, sym, &syminfo);
-		if (machdep->verify_symbol(syminfo.name, syminfo.value, 
+		name = strip_symbol_end(syminfo.name, buf);
+
+		if (machdep->verify_symbol(name, syminfo.value, 
 		    syminfo.type)) {
 			if (kt->flags & (RELOC_SET|RELOC_FORCE))
 				sp->value = relocate(syminfo.value,
@@ -562,8 +738,8 @@ store_symbols(bfd *abfd, int dynamic, void *minisyms, long symcount,
 			else
 				sp->value = syminfo.value;
 			sp->type = syminfo.type;
-			namespace_ctl(NAMESPACE_INSTALL, &st->namespace,
-				sp, (char *)syminfo.name); 
+			namespace_ctl(NAMESPACE_INSTALL, &st->kernel_namespace,
+				sp, name); 
 			sp++;
 			st->symcnt++;
 		}
@@ -573,7 +749,7 @@ store_symbols(bfd *abfd, int dynamic, void *minisyms, long symcount,
 
 	st->flags |= KERNEL_SYMS;
 
-	namespace_ctl(NAMESPACE_COMPLETE, &st->namespace, 
+	namespace_ctl(NAMESPACE_COMPLETE, &st->kernel_namespace, 
 		st->symtable, st->symend);
 }
 
@@ -587,6 +763,7 @@ store_sysmap_symbols(void)
 	int c, first;
 	long symcount;
 	char buf[BUFSIZE];
+	char name[BUFSIZE];
 	FILE *map;
         char *mapitems[MAXARGS];
 	struct syment *sp, syment;
@@ -603,12 +780,13 @@ store_sysmap_symbols(void)
                 error(FATAL, "symbol table syment space malloc: %s\n",
                         strerror(errno));
 
-        if (!namespace_ctl(NAMESPACE_INIT, &st->namespace,
+        if (!namespace_ctl(NAMESPACE_INIT, &st->kernel_namespace,
             (void *)symcount, NULL))
                 error(FATAL, "symbol table namespace malloc: %s\n",
                         strerror(errno));
 
-	if (!machine_type("X86"))
+	if (!machine_type("X86") && !machine_type("X86_64") &&
+	    !machine_type("ARM64"))
 		kt->flags &= ~RELOC_SET;
 
 	first = 0;
@@ -626,7 +804,10 @@ store_sysmap_symbols(void)
 		syment.type = mapitems[1][0];
 		syment.name = mapitems[2];
 
-                if (machdep->verify_symbol(syment.name, syment.value, 
+		strcpy(name, syment.name);
+		strip_symbol_end(name, NULL);
+
+                if (machdep->verify_symbol(name, syment.value, 
 		    syment.type)) {
 			if (kt->flags & RELOC_SET)
 				sp->value = relocate(syment.value,
@@ -634,8 +815,8 @@ store_sysmap_symbols(void)
 			else
 				sp->value = syment.value;
                         sp->type = syment.type;
-                        namespace_ctl(NAMESPACE_INSTALL, &st->namespace,
-                                sp, syment.name);
+                        namespace_ctl(NAMESPACE_INSTALL, &st->kernel_namespace,
+                                sp, name);
                         sp++;
                         st->symcnt++;
                 }
@@ -647,7 +828,7 @@ store_sysmap_symbols(void)
 
         st->flags |= KERNEL_SYMS;
 
-        namespace_ctl(NAMESPACE_COMPLETE, &st->namespace,
+        namespace_ctl(NAMESPACE_COMPLETE, &st->kernel_namespace,
                 st->symtable, st->symend);
 
 	symname_hash_init();
@@ -655,12 +836,17 @@ store_sysmap_symbols(void)
 }
 
 /*
- *  Handle x86 kernels configured such that the vmlinux symbols
+ *  Handle x86/arm64 kernels configured such that the vmlinux symbols
  *  are not as loaded into the kernel (not unity-mapped).
  */
 static ulong
 relocate(ulong symval, char *symname, int first_symbol)
 {
+	if (XEN_HYPER_MODE()) {
+		kt->flags &= ~(RELOC_SET|RELOC_FORCE);
+		return symval;
+	}
+
 	switch (kt->flags & (RELOC_SET|RELOC_FORCE))
 	{
 	case RELOC_SET: 
@@ -672,7 +858,20 @@ relocate(ulong symval, char *symname, int first_symbol)
 		break;
 	}
 
-	return (symval - kt->relocate);
+	if (machine_type("X86_64")) {
+		/*
+		 * There are some symbols which are outside of any section
+		 * either because they are offsets or because they are absolute
+		 * addresses.  These should not be relocated.
+		 */
+		if (symval >= st->first_section_start &&
+			symval <= st->last_section_end) {
+			return symval - kt->relocate;
+		} else {
+			return symval;
+		}
+	} else
+		return symval - kt->relocate;
 }
 
 /*
@@ -685,10 +884,11 @@ relocate(ulong symval, char *symname, int first_symbol)
 static int
 relocate_force(ulong symval, char *symname)
 {
+	int count, found;
         FILE *kp;
 	char buf[BUFSIZE];
         char *kallsyms[MAXARGS];
-	ulong first;
+	ulong kallsym;
 
 	if (!ACTIVE() || !file_exists("/proc/kallsyms", NULL)) {
 		if (CRASHDEBUG(1))
@@ -706,42 +906,96 @@ relocate_force(ulong symval, char *symname)
                 return FALSE;
         }
 
-	if (!fgets(buf, BUFSIZE, kp) ||
-	    (parse_line(buf, kallsyms) != 3) ||
-	    !hexadecimal(kallsyms[0], 0)) {
-		fclose(kp);
-		if (CRASHDEBUG(1))
-			fprintf(fp, 
-			    "malformed /proc/kallsyms: cannot determine relocation value\n");
-		return FALSE;
-	}
-	fclose(kp);
-
-	first = htol(kallsyms[0], RETURN_ON_ERROR, NULL);
 
 	if (CRASHDEBUG(1))
 		fprintf(fp, 
-		    "RELOCATE: %s @ %lx %s\n"
-		    "          %s @ %lx /proc/kallsyms\n",
-			symname, symval, pc->namelist,
-			kallsyms[2], first);
+		    "relocate from: %s\n"
+		    "  %s @ %lx\n"
+		    "relocate to: /proc/kallsyms\n",
+			pc->namelist, symname, symval);
+
+	found = FALSE;
+	count = kallsym = 0;
+
+	while (!found && fgets(buf, BUFSIZE, kp) &&
+	    (parse_line(buf, kallsyms) == 3) && 
+	    hexadecimal(kallsyms[0], 0)) {
+
+		if (STREQ(kallsyms[2], symname)) {
+			kallsym = htol(kallsyms[0], RETURN_ON_ERROR, NULL);
+			found = TRUE;
+		}
+
+		count++;
+
+		if (CRASHDEBUG(1))
+			fprintf(fp, 
+			    "  %s @ %s %s\n",
+				kallsyms[2], kallsyms[0],
+				STREQ(kallsyms[2], symname) ? 
+				"(match!)" : "");
+	}
+	fclose(kp);
 
 	/*
 	 *  If the symbols match and have different values,
 	 *  force the relocation.
 	 */
-	if (STREQ(symname, kallsyms[2])) {
-		if (symval > first) {
-			kt->relocate = symval - first;
+	if (found) {
+		if (symval != kallsym) {
+			kt->relocate = symval - kallsym;
 			return TRUE;
 		}
 	}
 
 	if (CRASHDEBUG(1))
 		fprintf(fp, 
-		    "cannot determine relocation value from first symbol\n");
+		    "cannot determine relocation value from"
+		    " %d symbols in /proc/kallsyms\n", count);
 
 	return FALSE;
+}
+
+/*
+ *  Get a symbol value from /proc/kallsyms.
+ */
+static ulong
+symbol_value_from_proc_kallsyms(char *symname)
+{
+        FILE *kp;
+	char buf[BUFSIZE];
+        char *kallsyms[MAXARGS];
+	ulong kallsym;
+	int found;
+
+	if (!file_exists("/proc/kallsyms", NULL)) {
+		if (CRASHDEBUG(1))
+		    	error(INFO, "cannot determine value of %s: "
+		    		"/proc/kallsyms does not exist\n\n", symname);
+		return BADVAL;
+	}
+
+	if ((kp = fopen("/proc/kallsyms", "r")) == NULL) {
+		if (CRASHDEBUG(1))
+			error(INFO, "cannot determine value of %s: "
+		    		"cannot open /proc/kallsyms\n\n", symname);
+		return BADVAL;
+	}
+
+	found = FALSE;
+	while (!found && fgets(buf, BUFSIZE, kp) &&
+	    (parse_line(buf, kallsyms) == 3) && 
+	    hexadecimal(kallsyms[0], 0)) {
+
+		if (STREQ(kallsyms[2], symname)) {
+			kallsym = htol(kallsyms[0], RETURN_ON_ERROR, NULL);
+			found = TRUE;
+			break;
+		}
+	}
+	fclose(kp);
+
+	return(found ? kallsym : BADVAL);
 }
 
 /*
@@ -883,22 +1137,34 @@ symname_hash_search(char *name)
  */
 
 #define MODULE_PSEUDO_SYMBOL(sp) \
-    (STRNEQ((sp)->name, "_MODULE_START_") || STRNEQ((sp)->name, "_MODULE_END_"))
+    ((STRNEQ((sp)->name, "_MODULE_START_") || STRNEQ((sp)->name, "_MODULE_END_")) || \
+    (STRNEQ((sp)->name, "_MODULE_INIT_START_") || STRNEQ((sp)->name, "_MODULE_INIT_END_")) || \
+    (STRNEQ((sp)->name, "_MODULE_SECTION_")))
 
 #define MODULE_START(sp) (STRNEQ((sp)->name, "_MODULE_START_"))
 #define MODULE_END(sp)   (STRNEQ((sp)->name, "_MODULE_END_"))
+#define MODULE_INIT_START(sp) (STRNEQ((sp)->name, "_MODULE_INIT_START_"))
+#define MODULE_INIT_END(sp)   (STRNEQ((sp)->name, "_MODULE_INIT_END_"))
+#define MODULE_SECTION_START(sp) (STRNEQ((sp)->name, "_MODULE_SECTION_START"))
+#define MODULE_SECTION_END(sp)   (STRNEQ((sp)->name, "_MODULE_SECTION_END"))
 
 static void
 symbol_dump(ulong flags, char *module)
 {
-	int i;
+	int i, start, percpu_syms;
         struct syment *sp, *sp_end;
 	struct load_module *lm;
 	char *p1, *p2;;
 
+#define TBD  1
+#define DISPLAYED 2
+
 	if (flags & KERNEL_SYMS) {
-        	for (sp = st->symtable; sp < st->symend; sp++) 
+		for (sp = st->symtable; sp < st->symend; sp++) {
 			show_symbol(sp, 0, SHOW_RADIX());
+			if (received_SIGINT() || output_closed())
+				return;
+		}
 	}
 
 	if (!(flags & MODULE_SYMS))
@@ -910,22 +1176,93 @@ symbol_dump(ulong flags, char *module)
 		if (module && !STREQ(module, lm->mod_name))
 			continue;
 
+		if (received_SIGINT() || output_closed())
+			return;
+
 		sp = lm->mod_symtable;
 		sp_end = lm->mod_symend;
+		percpu_syms = 0;
 
-                for ( ; sp <= sp_end; sp++) {
+                for (start = FALSE; sp <= sp_end; sp++) {
+
+			if (IN_MODULE_PERCPU(sp->value, lm)) {
+				if (percpu_syms == DISPLAYED)
+					continue;
+				if (!start) {
+					percpu_syms = TBD;
+					continue;
+				}
+				dump_percpu_symbols(lm);
+				percpu_syms = DISPLAYED;
+			}
+
 			if (MODULE_PSEUDO_SYMBOL(sp)) {
-				if (MODULE_START(sp)) {
+				if (MODULE_SECTION_START(sp)) {
+					p1 = sp->name +
+					     strlen("_MODULE_SECTION_START ");
+					p2 = "section start";
+				} else if (MODULE_SECTION_END(sp)) {
+					p1 = sp->name +
+					     strlen("_MODULE_SECTION_END ");
+					p2 = "section end";
+				} else if (MODULE_START(sp)) {
 					p1 = "MODULE START";
 					p2 = sp->name+strlen("_MODULE_START_");
+					start = TRUE;
 				} else {
 					p1 = "MODULE END";
 					p2 = sp->name+strlen("_MODULE_END_");
+					if (MODULE_PERCPU_SYMS_LOADED(lm) &&
+					    !percpu_syms) {
+						dump_percpu_symbols(lm);
+						percpu_syms = DISPLAYED;
+					}
 				}
 				fprintf(fp, "%lx %s: %s\n", sp->value, p1, p2);
+
+				if (percpu_syms == TBD) {
+					dump_percpu_symbols(lm);
+					percpu_syms = DISPLAYED;
+				}
 			} else
 				show_symbol(sp, 0, SHOW_RADIX());
                 }
+
+		if (lm->mod_init_symtable) {
+			sp = lm->mod_init_symtable;
+			sp_end = lm->mod_init_symend;
+
+			for ( ; sp <= sp_end; sp++) {
+				if (MODULE_PSEUDO_SYMBOL(sp)) {
+					if (MODULE_INIT_START(sp)) {
+						p1 = "MODULE INIT START";
+						p2 = sp->name+strlen("_MODULE_INIT_START_");
+					} else {
+						p1 = "MODULE INIT END";
+						p2 = sp->name+strlen("_MODULE_INIT_END_");
+					}
+					fprintf(fp, "%lx %s: %s\n", sp->value, p1, p2);
+				} else
+					show_symbol(sp, 0, SHOW_RADIX());
+			}
+		}
+	}
+#undef TBD
+#undef DISPLAYED
+}
+
+static void
+dump_percpu_symbols(struct load_module *lm)
+{
+	struct syment *sp, *sp_end;
+
+	if (MODULE_PERCPU_SYMS_LOADED(lm)) {
+		sp = lm->mod_symtable;
+		sp_end = lm->mod_symend;
+		for ( ; sp <= sp_end; sp++) {
+			if (IN_MODULE_PERCPU(sp->value, lm))
+				show_symbol(sp, 0, SHOW_RADIX());
+		}
 	}
 }
 
@@ -1067,6 +1404,7 @@ store_module_symbols_v1(ulong total, int mods_installed)
 
 		st->ext_module_symtable[mcnt].value = mod;
 		st->ext_module_symtable[mcnt].type = 'm';
+		st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 		sprintf(buf2, "%s%s", "_MODULE_START_", name);
 		namespace_ctl(NAMESPACE_INSTALL, &st->ext_module_namespace,
 			&st->ext_module_symtable[mcnt], buf2);
@@ -1083,9 +1421,11 @@ store_module_symbols_v1(ulong total, int mods_installed)
 		for (i = first = last = 0; i < nsyms; i++) {
 			modsym = (struct module_symbol *)
 			    (modsymbuf + (i * sizeof(struct module_symbol)));
-			if (!first)
+			if (!first
+			    || first > (ulong)modsym->name)
 				first = (ulong)modsym->name;
-			last = (ulong)modsym->name;
+			if ((ulong)modsym->name > last)
+				last = (ulong)modsym->name;
 		}
 
 		if (last > first) {
@@ -1106,14 +1446,10 @@ store_module_symbols_v1(ulong total, int mods_installed)
 		} else
 			strbuf = NULL;
 
-		for (i = first = last = 0; i < nsyms; i++) {
+		for (i = 0; i < nsyms; i++) {
 
 			modsym = (struct module_symbol *)
 			    (modsymbuf + (i * sizeof(struct module_symbol)));
-
-			if (!first) 
-				first = (ulong)modsym->name;
-			last = (ulong)modsym->name;
 
 			BZERO(buf1, BUFSIZE);
 
@@ -1128,10 +1464,12 @@ store_module_symbols_v1(ulong total, int mods_installed)
 				st->ext_module_symtable[mcnt].value = 
 					modsym->value;
 				st->ext_module_symtable[mcnt].type = '?'; 
+				st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 				strip_module_symbol_end(buf1);
-                		namespace_ctl(NAMESPACE_INSTALL, 
+				strip_symbol_end(buf1, NULL);
+				namespace_ctl(NAMESPACE_INSTALL, 
 				    &st->ext_module_namespace,
-                        	    &st->ext_module_symtable[mcnt], buf1);
+				    &st->ext_module_symtable[mcnt], buf1);
 
 				if (strstr(buf1, rodata))
 					lm->mod_etext_guess = modsym->value;
@@ -1169,6 +1507,7 @@ store_module_symbols_v1(ulong total, int mods_installed)
 
 		st->ext_module_symtable[mcnt].value = mod + size;
 		st->ext_module_symtable[mcnt].type = 'm';
+		st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 		sprintf(buf2, "%s%s", "_MODULE_END_", name);
                 namespace_ctl(NAMESPACE_INSTALL, 
 			&st->ext_module_namespace,
@@ -1243,6 +1582,8 @@ store_module_symbols_v2(ulong total, int mods_installed)
 	struct load_module *lm;
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
+	char buf3[BUFSIZE];
+	char buf4[BUFSIZE];
 	char *strbuf, *modbuf, *modsymbuf;
 	struct syment *sp;
 	ulong first, last;
@@ -1322,14 +1663,20 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		lm->mod_ext_symcnt = mcnt;
 		lm->mod_init_module_ptr = ULONG(modbuf + 
 			OFFSET(module_module_init));
+		if (VALID_MEMBER(module_percpu))
+			lm->mod_percpu = ULONG(modbuf + OFFSET(module_percpu));
 		if (THIS_KERNEL_VERSION >= LINUX(2,6,27)) {
 			lm->mod_etext_guess = lm->mod_base +
 				UINT(modbuf + OFFSET(module_core_text_size));
+			lm->mod_init_size =
+				UINT(modbuf + OFFSET(module_init_size));
 			lm->mod_init_text_size = 
 				UINT(modbuf + OFFSET(module_init_text_size));
 		} else {
 			lm->mod_etext_guess = lm->mod_base +
 				ULONG(modbuf + OFFSET(module_core_text_size));
+			lm->mod_init_size =
+				ULONG(modbuf + OFFSET(module_init_size));
 			lm->mod_init_text_size = 
 				ULONG(modbuf + OFFSET(module_init_text_size));
 		}
@@ -1337,11 +1684,26 @@ store_module_symbols_v2(ulong total, int mods_installed)
 
 		st->ext_module_symtable[mcnt].value = lm->mod_base;
 		st->ext_module_symtable[mcnt].type = 'm';
+		st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 		sprintf(buf2, "%s%s", "_MODULE_START_", mod_name);
 		namespace_ctl(NAMESPACE_INSTALL, &st->ext_module_namespace,
 			&st->ext_module_symtable[mcnt], buf2);
 		lm_mcnt = mcnt;
 		mcnt++;
+
+		if (lm->mod_init_size > 0) {
+			st->ext_module_symtable[mcnt].value = lm->mod_init_module_ptr;
+			st->ext_module_symtable[mcnt].type = 'm';
+			st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
+			sprintf(buf3, "%s%s", "_MODULE_INIT_START_", mod_name);
+			namespace_ctl(NAMESPACE_INSTALL, 
+					&st->ext_module_namespace,
+					&st->ext_module_symtable[mcnt], buf3);
+			lm_mcnt = mcnt;
+			mcnt++;
+			lm->mod_flags |= MOD_INIT;
+		}
+
 
 		if (nsyms && !IN_MODULE(syms, lm)) {
 			error(WARNING, 
@@ -1361,9 +1723,11 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		for (i = first = last = 0; i < nsyms; i++) {
 			modsym = (struct kernel_symbol *)
 			    (modsymbuf + (i * sizeof(struct kernel_symbol)));
-			if (!first)
+			if (!first
+			    || first > (ulong)modsym->name)
 				first = (ulong)modsym->name;
-			last = (ulong)modsym->name;
+			if ((ulong)modsym->name > last)
+				last = (ulong)modsym->name;
 		}
 
 		if (last > first) {
@@ -1384,14 +1748,11 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		} else 
 			strbuf = NULL;
 
-		for (i = first = last = 0; i < nsyms; i++) {
+
+		for (i = 0; i < nsyms; i++) {
 
 			modsym = (struct kernel_symbol *)
 			    (modsymbuf + (i * sizeof(struct kernel_symbol)));
-
-			if (!first) 
-				first = (ulong)modsym->name;
-			last = (ulong)modsym->name;
 
 			BZERO(buf1, BUFSIZE);
 
@@ -1406,10 +1767,12 @@ store_module_symbols_v2(ulong total, int mods_installed)
 				st->ext_module_symtable[mcnt].value = 
 					modsym->value;
 				st->ext_module_symtable[mcnt].type = '?'; 
+				st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 				strip_module_symbol_end(buf1);
-                		namespace_ctl(NAMESPACE_INSTALL, 
+				strip_symbol_end(buf1, NULL);
+				namespace_ctl(NAMESPACE_INSTALL, 
 				    &st->ext_module_namespace,
-                        	    &st->ext_module_symtable[mcnt], buf1);
+				    &st->ext_module_symtable[mcnt], buf1);
 
 				mcnt++;
 			}
@@ -1434,9 +1797,11 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		for (i = first = last = 0; i < ngplsyms; i++) {
 			modsym = (struct kernel_symbol *)
 			    (modsymbuf + (i * sizeof(struct kernel_symbol)));
-			if (!first)
+			if (!first
+			    || first > (ulong)modsym->name)
 				first = (ulong)modsym->name;
-			last = (ulong)modsym->name;
+			if ((ulong)modsym->name > last)
+				last = (ulong)modsym->name;
 		}
 
 		if (last > first) {
@@ -1457,14 +1822,10 @@ store_module_symbols_v2(ulong total, int mods_installed)
 		} else 
 			strbuf = NULL;
 
-		for (i = first = last = 0; i < ngplsyms; i++) {
+		for (i = 0; i < ngplsyms; i++) {
 
 			modsym = (struct kernel_symbol *)
 			    (modsymbuf + (i * sizeof(struct kernel_symbol)));
-
-			if (!first) 
-				first = (ulong)modsym->name;
-			last = (ulong)modsym->name;
 
 			BZERO(buf1, BUFSIZE);
 
@@ -1479,10 +1840,12 @@ store_module_symbols_v2(ulong total, int mods_installed)
 				st->ext_module_symtable[mcnt].value = 
 					modsym->value;
 				st->ext_module_symtable[mcnt].type = '?'; 
+				st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 				strip_module_symbol_end(buf1);
-                		namespace_ctl(NAMESPACE_INSTALL, 
+				strip_symbol_end(buf1, NULL);
+				namespace_ctl(NAMESPACE_INSTALL, 
 				    &st->ext_module_namespace,
-                        	    &st->ext_module_symtable[mcnt], buf1);
+				    &st->ext_module_symtable[mcnt], buf1);
 
 				mcnt++;
 			}
@@ -1513,11 +1876,23 @@ store_module_symbols_v2(ulong total, int mods_installed)
 
 		st->ext_module_symtable[mcnt].value = lm->mod_base + size;
 		st->ext_module_symtable[mcnt].type = 'm';
+		st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
 		sprintf(buf2, "%s%s", "_MODULE_END_", mod_name);
                 namespace_ctl(NAMESPACE_INSTALL, 
 			&st->ext_module_namespace,
                         &st->ext_module_symtable[mcnt], buf2);
 		mcnt++;
+
+		if (lm->mod_init_size > 0) {
+			st->ext_module_symtable[mcnt].value = lm->mod_init_module_ptr + lm->mod_init_size;
+			st->ext_module_symtable[mcnt].type = 'm';
+			st->ext_module_symtable[mcnt].flags |= MODULE_SYMBOL;
+			sprintf(buf4, "%s%s", "_MODULE_INIT_END_", mod_name);
+			namespace_ctl(NAMESPACE_INSTALL, 
+					&st->ext_module_namespace,
+					&st->ext_module_symtable[mcnt], buf4);
+			mcnt++;
+		}
 
 		lm->mod_ext_symcnt = mcnt - lm->mod_ext_symcnt;
 
@@ -1544,6 +1919,8 @@ store_module_symbols_v2(ulong total, int mods_installed)
                 lm = &st->load_modules[m];
 		sprintf(buf1, "_MODULE_START_%s", lm->mod_name);
 		sprintf(buf2, "_MODULE_END_%s", lm->mod_name);
+		sprintf(buf3, "_MODULE_INIT_START_%s", lm->mod_name);
+		sprintf(buf4, "_MODULE_INIT_END_%s", lm->mod_name);
 
         	for (sp = st->ext_module_symtable; 
 		     sp < st->ext_module_symend; sp++) {
@@ -1555,6 +1932,12 @@ store_module_symbols_v2(ulong total, int mods_installed)
 				lm->mod_ext_symend = sp;
 				lm->mod_symend = sp;
 			}
+			if (STREQ(sp->name, buf3)) {
+				lm->mod_init_symtable = sp;
+			}
+			if (STREQ(sp->name, buf4)) {
+				lm->mod_init_symend = sp;
+			}
 		}
 	}
 
@@ -1562,6 +1945,10 @@ store_module_symbols_v2(ulong total, int mods_installed)
 
         if (symbol_query("__insmod_", NULL, NULL))
                 st->flags |= INSMOD_BUILTIN;
+
+	if (mcnt > total)
+		error(FATAL, "store_module_symbols_v2: total: %ld mcnt: %d\n", 
+			total, mcnt);
 }
 
 /*
@@ -1577,7 +1964,6 @@ store_module_kallsyms_v1(struct load_module *lm, int start, int curr,
 	char *module_buf;
 	char *header_buf;
 	uint symbols;
-	uint sections;
 	ulong name_off;
 	ulong sec_name_off;
 	ulong section_off;
@@ -1592,7 +1978,7 @@ store_module_kallsyms_v1(struct load_module *lm, int start, int curr,
 	int mcnt;
 	int mcnt_idx;
 	int found;
-	struct namespace *ns;
+	struct symbol_namespace *ns;
 
 	if (!(kt->flags & KALLSYMS_V1))
 		return 0;
@@ -1618,7 +2004,7 @@ store_module_kallsyms_v1(struct load_module *lm, int start, int curr,
 
 	header_buf = module_buf + (kallsyms_header - lm->mod_base);
         symbols = UINT(header_buf + OFFSET(kallsyms_header_symbols));
-        sections = UINT(header_buf + OFFSET(kallsyms_header_sections));
+//      sections = UINT(header_buf + OFFSET(kallsyms_header_sections));
 
 	if (CRASHDEBUG(7))
 		fprintf(fp, "kallsyms: module: %s\n", lm->mod_name);
@@ -1642,14 +2028,16 @@ store_module_kallsyms_v1(struct load_module *lm, int start, int curr,
                 if (!IN_MODULE_BUF_V1(nameptr)) {
                         if (CRASHDEBUG(7))
                                 error(INFO,
-                 "%s: invalid nameptr: %lx  (stringptr: %lx + name_off: %lx)\n",                                        lm->mod_name, nameptr,
+                 "%s: invalid nameptr: %lx  (stringptr: %lx + name_off: %lx)\n",
+                                        lm->mod_name, nameptr,
                                         stringptr, name_off);
                         continue;
                 }
                 if (!IN_MODULE_BUF_V1(secnameptr)) {
                         if (CRASHDEBUG(7))
                                 error(INFO,
-           "%s: invalid secnameptr: %lx (stringptr: %lx + sec_name_off: %lx)\n",                                        lm->mod_name, secnameptr,
+           "%s: invalid secnameptr: %lx (stringptr: %lx + sec_name_off: %lx)\n",
+                                        lm->mod_name, secnameptr,
                                         stringptr, sec_name_off);
                         continue;
                 }
@@ -1667,6 +2055,7 @@ store_module_kallsyms_v1(struct load_module *lm, int start, int curr,
 				continue;
 
 			strip_module_symbol_end(nameptr);
+			strip_symbol_end(nameptr, NULL);
 
 			if (CRASHDEBUG(7))
 				fprintf(fp,"  symbol: %lx \"%s\" section: %s\n",
@@ -1694,6 +2083,7 @@ store_module_kallsyms_v1(struct load_module *lm, int start, int curr,
 
                        	st->ext_module_symtable[mcnt_idx].value = symbol_addr;
                        	st->ext_module_symtable[mcnt_idx].type = type;
+                       	st->ext_module_symtable[mcnt_idx].flags |= MODULE_SYMBOL;
                         namespace_ctl(NAMESPACE_INSTALL,
                                 &st->ext_module_namespace,
                                 &st->ext_module_symtable[mcnt_idx++], nameptr);
@@ -1717,22 +2107,27 @@ struct elf_common {
 	ulong st_value;
 	ulong st_shndx;
 	unsigned char st_info;
+	ulong st_size;
 };
 
-static void Elf32_Sym_to_common(Elf32_Sym *e32, struct elf_common *ec)
+static void 
+Elf32_Sym_to_common(Elf32_Sym *e32, struct elf_common *ec)
 {
 	ec->st_name = (ulong)e32->st_name;
 	ec->st_value = (ulong)e32->st_value;
 	ec->st_shndx = (ulong)e32->st_shndx;
 	ec->st_info = e32->st_info;
+	ec->st_size = (ulong)e32->st_size;
 }
 
-static void Elf64_Sym_to_common(Elf64_Sym *e64, struct elf_common *ec)
+static void 
+Elf64_Sym_to_common(Elf64_Sym *e64, struct elf_common *ec)
 {
 	ec->st_name = (ulong)e64->st_name;
 	ec->st_value = (ulong)e64->st_value;
 	ec->st_shndx = (ulong)e64->st_shndx;
 	ec->st_info = e64->st_info;
+	ec->st_size = (ulong)e64->st_size;
 }
 
 static int
@@ -1740,15 +2135,14 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
                          char *modbuf)
 {
 	int i, j, found;
-	Elf32_Sym *elf32_sym;
-	Elf64_Sym *elf64_sym;
 	struct elf_common elf_common, *ec;
 	ulong nksyms, ksymtab, kstrtab;
 	char *module_buf, *ptr, *locsymtab, *locstrtab, *nameptr;
 	struct syment *sp;
-	struct namespace *ns;
+	struct symbol_namespace *ns;
         int mcnt;
         int mcnt_idx;
+	char *module_buf_init = NULL;
 
 	if (!(kt->flags & KALLSYMS_V2))
 		return 0;
@@ -1759,9 +2153,6 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
         ns = &st->ext_module_namespace;
 	ec = &elf_common;
 
-	elf32_sym = NULL;
-	elf64_sym = NULL;
-
         module_buf = GETBUF(lm->mod_size);
 
         if (!readmem(lm->mod_base, KVADDR, module_buf, lm->mod_size,
@@ -1771,30 +2162,50 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
                 return 0;
         }
 
+	if (lm->mod_init_size > 0) {
+		module_buf_init = GETBUF(lm->mod_init_size);
+
+		if (!readmem(lm->mod_init_module_ptr, KVADDR, module_buf_init, lm->mod_init_size,
+					"module init (kallsyms)", RETURN_ON_ERROR|QUIET)) {
+			error(WARNING,"cannot access module init kallsyms\n");
+			FREEBUF(module_buf_init);
+		}
+	}
+
 	if (THIS_KERNEL_VERSION >= LINUX(2,6,27))
 		nksyms = UINT(modbuf + OFFSET(module_num_symtab));
 	else
 		nksyms = ULONG(modbuf + OFFSET(module_num_symtab));
 
 	ksymtab = ULONG(modbuf + OFFSET(module_symtab));
-	if (!IN_MODULE(ksymtab, lm)) {
+	if (!IN_MODULE(ksymtab, lm) && !IN_MODULE_INIT(ksymtab, lm)) {
 		error(WARNING,
 		    "%s: module.symtab outside of module address space\n",
 			lm->mod_name);
 		FREEBUF(module_buf);
+		if (module_buf_init)
+			FREEBUF(module_buf_init);
 		return 0;
 	} 
-	locsymtab = module_buf + (ksymtab - lm->mod_base);
+	if (IN_MODULE(ksymtab, lm))
+		locsymtab = module_buf + (ksymtab - lm->mod_base);
+	else
+		locsymtab = module_buf_init + (ksymtab - lm->mod_init_module_ptr);
 
 	kstrtab = ULONG(modbuf + OFFSET(module_strtab));
-	if (!IN_MODULE(kstrtab, lm)) {
+	if (!IN_MODULE(kstrtab, lm) && !IN_MODULE_INIT(kstrtab, lm)) {
 		error(WARNING, 
 		    "%s: module.strtab outside of module address space\n",
 			lm->mod_name);
 		FREEBUF(module_buf);
+		if (module_buf_init)
+			FREEBUF(module_buf_init);
 		return 0;
 	}
-	locstrtab = module_buf + (kstrtab - lm->mod_base);
+	if (IN_MODULE(kstrtab, lm))
+		locstrtab = module_buf + (kstrtab - lm->mod_base);
+	else
+		locstrtab = module_buf_init + (kstrtab - lm->mod_init_module_ptr);
 
 	for (i = 1; i < nksyms; i++) {  /* ELF starts real symbols at 1 */
 		switch (BITS())
@@ -1809,14 +2220,16 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
 			break;
 		}
 
-		if ((ec->st_value < lm->mod_base) || 
-		    (ec->st_value >  (lm->mod_base + lm->mod_size))) 
+		if (((ec->st_value < lm->mod_base) ||
+		    (ec->st_value >  (lm->mod_base + lm->mod_size))) &&
+		    ((ec->st_value < lm->mod_init_module_ptr) ||
+		    (ec->st_value > (lm->mod_init_module_ptr + lm->mod_init_size))))
 				continue;
 
 		if (ec->st_shndx == SHN_UNDEF)
                         continue;
 
-		if (!IN_MODULE(kstrtab + ec->st_name, lm)) {
+		if (!IN_MODULE(kstrtab + ec->st_name, lm) && !IN_MODULE_INIT(kstrtab + ec->st_name, lm)) {
 			if (CRASHDEBUG(3)) {
 				error(WARNING, 
 				   "%s: bad st_name index: %lx -> %lx\n        "
@@ -1833,11 +2246,22 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
 		if (*nameptr == '\0')
 			continue;
 
+		/*
+		 * On ARM/ARM64 we have linker mapping symbols like '$a'
+		 * or '$x' for ARM64, and '$d'.
+		 * Make sure that these don't end up into our symbol list.
+		 */
+		if ((machine_type("ARM") || machine_type("ARM64")) &&
+		    !machdep->verify_symbol(nameptr, ec->st_value, ec->st_info))
+			continue;
+
 		if (CRASHDEBUG(7))
 			fprintf(fp, 
 	          "%s: st_name: %ld st_value: %lx st_shndx: %ld st_info: %c\n",
 				nameptr, ec->st_name, ec->st_value, 
 				ec->st_shndx, ec->st_info);
+
+		strip_symbol_end(nameptr, NULL);
 
                 for (found = 0, j = start; j < curr; j++) {
                         sp = &st->ext_module_symtable[j];
@@ -1860,6 +2284,7 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
 
                 st->ext_module_symtable[mcnt_idx].value = ec->st_value;
                 st->ext_module_symtable[mcnt_idx].type = ec->st_info;
+                st->ext_module_symtable[mcnt_idx].flags |= MODULE_SYMBOL;
                 namespace_ctl(NAMESPACE_INSTALL,
                 	&st->ext_module_namespace,
                         &st->ext_module_symtable[mcnt_idx++], nameptr);
@@ -1868,6 +2293,8 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
 
         lm->mod_flags |= MOD_KALLSYMS;
         FREEBUF(module_buf);
+	if (module_buf_init)
+		FREEBUF(module_buf_init);
 
         return mcnt;
 }
@@ -1896,6 +2323,50 @@ strip_module_symbol_end(char *buf)
 
 	*p1 = NULLCHAR;
 }
+
+
+/* 
+ * Return the lowest or highest module virtual address.
+ */
+ulong
+lowest_module_address(void)
+{
+	int i;
+	struct load_module *lm;
+	ulong low, lowest;
+
+	if (!st->mods_installed)
+		return 0;
+
+	lowest = (ulong)(-1);
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		low = lm->mod_base;
+		if (low < lowest)
+			lowest = low;
+	}
+
+	return lowest;
+}
+
+ulong
+highest_module_address(void)
+{
+	int i;
+	struct load_module *lm;
+	ulong high, highest;
+
+	highest = 0;
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		high = lm->mod_base + lm->mod_size;
+		if (high > highest)
+			highest = high;
+	}
+
+	return highest;
+}
+
 
 /*
  *  Look through a string for bogus kernel clutter of an exported 
@@ -2047,7 +2518,7 @@ load_module_filter(char *s, int type)
 #define AVERAGE_SYMBOL_SIZE (16)
 
 static int
-namespace_ctl(int cmd, struct namespace *ns, void *nsarg1, void *nsarg2)
+namespace_ctl(int cmd, struct symbol_namespace *ns, void *nsarg1, void *nsarg2)
 {
 	char *addr;
 	struct syment *sp, *sp_end;
@@ -2131,6 +2602,7 @@ static int
 compare_syms(const void *v1, const void *v2)
 {
 	struct syment *s1, *s2;
+	char sn1[BUFSIZE], sn2[BUFSIZE];
 
 	s1 = (struct syment *)v1;
 	s2 = (struct syment *)v2;
@@ -2142,6 +2614,55 @@ compare_syms(const void *v1, const void *v2)
 			return 1;
 		if (STRNEQ(s2->name, "_MODULE_START_"))
 			return 1;
+		/* Get pseudo section name. */
+		if (MODULE_SECTION_START(s1))
+			sscanf(s1->name, "_MODULE_SECTION_START [%s]", sn1);
+		else if (MODULE_SECTION_END(s1))
+			sscanf(s1->name, "_MODULE_SECTION_END [%s]", sn1);
+
+		if (MODULE_SECTION_START(s2))
+			sscanf(s2->name, "_MODULE_SECTION_START [%s]", sn2);
+		else if (MODULE_SECTION_END(s2))
+			sscanf(s2->name, "_MODULE_SECTION_END [%s]", sn2);
+
+		/*
+		 * Sort pseudo symbols in mind section.
+		 * The same values must be sorted like examples.
+		 * - exp1
+		 *  c9046000 MODULE START: sctp
+		 *  c9046000 [.data]: section start
+		 *  c9046000 (D) sctp_timer_events
+		 *
+		 * - exp2
+		 *  c9046c68 [.bss]: section end
+		 *  c9046c68 MODULE END: sctp
+		 *
+		 * - exp3
+		 *   c90e9b44 [.text]: section end
+		 *   c90e9b44 [.exit.text]: section start
+		 *   c90e9b44 (T) cleanup_module
+		 *   c90e9b44 (t) sctp_exit
+		 *   c90e9c81 [.exit.text]: section end
+		 */
+		if (MODULE_SECTION_END(s1)) {
+			if (!MODULE_PSEUDO_SYMBOL(s2) || MODULE_END(s2))
+				return -1;
+			else if (MODULE_SECTION_START(s2) && !STREQ(sn1, sn2))
+				return -1;
+			return 1;
+		}
+		if (MODULE_SECTION_END(s2)) {
+			if (MODULE_END(s1) || !MODULE_PSEUDO_SYMBOL(s1))
+				return 1;
+			else if (MODULE_SECTION_START(s1) && STREQ(sn1, sn2))
+				return 1;
+			return -1;
+		}
+		if (MODULE_SECTION_START(s2)) {
+			if (MODULE_START(s1))
+				return -1;
+			return 1;
+		}
 	}
 
 	return (s1->value < s2->value ? -1 : 
@@ -2178,12 +2699,16 @@ is_kernel_text(ulong value)
 	start = 0;
 
 	if (pc->flags & SYSMAP) {
-		sp = st->symtable;
-		if ((value >= sp->value) && (value < kt->etext))
+		if ((sp = value_search(value, NULL)) && is_symbol_text(sp))
 			return TRUE;
-        	if ((sp = value_search(value, NULL)) &&
-		    ((sp->type == 'T') || (sp->type == 't'))) 
-			return TRUE;
+
+		for (sp = st->symtable; sp < st->symend; sp++) {
+			if (!is_symbol_text(sp))
+				continue;
+			if ((value >= sp->value) && (value < kt->etext))
+				return TRUE;
+			break;
+		}
 	} else {
 	        sec = (asection **)st->sections;
 	        for (i = 0; i < st->bfd->section_count; i++, sec++) {
@@ -2200,8 +2725,7 @@ is_kernel_text(ulong value)
 		}
 	}
 
-        if ((sp = value_search(value, NULL)) &&
-	    ((sp->type == 'T') || (sp->type == 't'))) 
+        if ((sp = value_search(value, NULL)) && is_symbol_text(sp))
 		return TRUE;
 
         if (NO_MODULES())
@@ -2210,7 +2734,7 @@ is_kernel_text(ulong value)
         for (i = 0; i < st->mods_installed; i++) {
                 lm = &st->load_modules[i];
 
-		if (!IN_MODULE(value, lm))
+		if (!IN_MODULE(value, lm) && !IN_MODULE_INIT(value, lm))
 			continue;
 
 		if (lm->mod_flags & MOD_LOAD_SYMS) {
@@ -2232,10 +2756,15 @@ is_kernel_text(ulong value)
 				start = lm->mod_base + lm->mod_size_of_struct;
 				break;
 			case KMOD_V2:
-				start = lm->mod_base;
+				if (IN_MODULE(value, lm))
+					start = lm->mod_base;
+				else
+					start = lm->mod_init_module_ptr;
 				break;
 			}
 			end = lm->mod_etext_guess;
+			if (IN_MODULE_INIT(value, lm) && end < lm->mod_init_module_ptr + lm->mod_init_size)
+				end = lm->mod_init_module_ptr + lm->mod_init_size;
 
 	        	if ((value >= start) && (value < end)) 
 	               		return TRUE;
@@ -2264,6 +2793,11 @@ is_kernel_text_offset(ulong value)
 	return(offset ? TRUE : FALSE);
 }
 
+int
+is_symbol_text(struct syment *sp)
+{
+	return ((sp->type == 'T') || (sp->type == 't'));
+}
 
 /*
  *  Check whether an address is most likely kernel data.
@@ -2298,6 +2832,138 @@ is_rodata(ulong value, struct syment **spp)
 }
 
 /*
+ *  For a given kernel virtual address, request that gdb return 
+ *  the address range of the containing function.  For module 
+ *  text addresses, its debuginfo data must be loaded.
+ */
+int
+get_text_function_range(ulong vaddr, ulong *low, ulong *high)
+{
+	struct syment *sp;
+	struct gnu_request gnu_request, *req = &gnu_request;
+	struct load_module *lm;
+	ulong size;
+
+	if (!(sp = value_search(vaddr, NULL)))
+		return FALSE;
+
+	if (module_symbol(vaddr, NULL, &lm, NULL, 0)) {
+		if (kallsyms_module_function_size(sp, lm, &size)) {
+			*low = sp->value;
+			*high = sp->value + size;
+			return TRUE;
+		}
+	}
+
+	BZERO(req, sizeof(struct gnu_request));
+	req->command = GNU_GET_FUNCTION_RANGE;
+	req->pc = sp->value;
+	req->name = sp->name;
+	gdb_interface(req);
+	if (req->flags & GNU_COMMAND_FAILED)
+		return FALSE;
+
+	if ((vaddr < req->addr) || (vaddr >= req->addr2))
+		return FALSE;
+
+	*low = req->addr;
+	*high = req->addr2;
+
+	return TRUE;
+}
+
+/*
+ *  Get the text size of a module function from kallsyms. 
+ */
+static int 
+kallsyms_module_function_size(struct syment *sp, struct load_module *lm, ulong *size)
+{
+	int i;
+	ulong nksyms, ksymtab, st_size;
+	char *ptr, *module_buf, *module_buf_init, *modbuf, *locsymtab;
+	struct elf_common elf_common, *ec;
+
+	if (!(lm->mod_flags & MOD_KALLSYMS) || !(kt->flags & KALLSYMS_V2))
+		return FALSE;
+
+	module_buf = GETBUF(lm->mod_size);
+	modbuf = module_buf + (lm->module_struct - lm->mod_base);
+
+	if (!readmem(lm->mod_base, KVADDR, module_buf, lm->mod_size,
+	    "module (kallsyms)", RETURN_ON_ERROR|QUIET)) {
+		FREEBUF(module_buf);
+		return FALSE;
+	}
+
+	if (lm->mod_init_size > 0) {
+		module_buf_init = GETBUF(lm->mod_init_size);
+		if (!readmem(lm->mod_init_module_ptr, KVADDR, module_buf_init, 
+		    lm->mod_init_size, "module init (kallsyms)", 
+		    RETURN_ON_ERROR|QUIET)) {
+			FREEBUF(module_buf_init);
+			module_buf_init = NULL;
+		}
+	} else
+	 	module_buf_init = NULL;
+
+	if (THIS_KERNEL_VERSION >= LINUX(2,6,27))
+		nksyms = UINT(modbuf + OFFSET(module_num_symtab));
+	else
+		nksyms = ULONG(modbuf + OFFSET(module_num_symtab));
+
+        ksymtab = ULONG(modbuf + OFFSET(module_symtab));
+        if (!IN_MODULE(ksymtab, lm) && !IN_MODULE_INIT(ksymtab, lm)) {
+                FREEBUF(module_buf);
+                if (module_buf_init)
+                        FREEBUF(module_buf_init);
+                return FALSE;
+        }
+
+        if (IN_MODULE(ksymtab, lm))
+                locsymtab = module_buf + (ksymtab - lm->mod_base);
+        else
+                locsymtab = module_buf_init + (ksymtab - lm->mod_init_module_ptr);
+
+	st_size = 0;
+	ec = &elf_common;
+	BZERO(&elf_common, sizeof(struct elf_common));
+
+        for (i = 1; i < nksyms; i++) {  /* ELF starts real symbols at 1 */
+                switch (BITS())
+                {
+                case 32:
+                        ptr = locsymtab + (i * sizeof(Elf32_Sym));
+                        Elf32_Sym_to_common((Elf32_Sym *)ptr, ec);
+                        break;
+                case 64:
+                        ptr = locsymtab + (i * sizeof(Elf64_Sym));
+                        Elf64_Sym_to_common((Elf64_Sym *)ptr, ec);
+                        break;
+                }
+
+		if (sp->value == ec->st_value) {
+			if (CRASHDEBUG(1))
+				fprintf(fp, "kallsyms_module_function_size: "
+				    "st_value: %lx  st_size: %ld\n", 
+					ec->st_value, ec->st_size);
+			st_size = ec->st_size;
+			break;
+		}
+	}
+
+	if (module_buf_init)
+		FREEBUF(module_buf_init);
+	FREEBUF(module_buf);
+
+	if (st_size) {
+		*size = st_size;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+/*
  *  "help -s" output
  */
 void
@@ -2306,6 +2972,7 @@ dump_symbol_table(void)
 	int i, s, cnt, tot;
         struct load_module *lm;
 	struct syment *sp;
+	struct downsized *ds;
 	int others;
 	asection **sec;
 
@@ -2345,6 +3012,8 @@ dump_symbol_table(void)
                 fprintf(fp, "%sMODSECT_V3", others++ ? "|" : "");
         if (st->flags & MODSECT_UNKNOWN)
                 fprintf(fp, "%sMODSECT_UNKNOWN", others++ ? "|" : "");
+        if (st->flags & NO_STRIP)
+                fprintf(fp, "%sNO_STRIP", others++ ? "|" : "");
         fprintf(fp, ")\n");
 
 	fprintf(fp, "                 bfd: %lx\n", (ulong)st->bfd);
@@ -2367,6 +3036,17 @@ dump_symbol_table(void)
 		fprintf(fp, "     __per_cpu_start: (unused)\n");
 		fprintf(fp, "       __per_cpu_end: (unused)\n");
 	}
+
+	fprintf(fp, " first_section_start: %lx\n", st->first_section_start);
+	fprintf(fp, "    last_section_end: %lx\n", st->last_section_end);
+
+	fprintf(fp, "      _stext_vmlinux: %lx ", st->_stext_vmlinux);
+	if (st->_stext_vmlinux == UNINITIALIZED)
+		fprintf(fp, "(UNINITIALIZED)\n");
+	else if (st->_stext_vmlinux == 0)
+		fprintf(fp, "(unused)\n");
+	else
+		fprintf(fp, "\n");
 
         fprintf(fp, "    symval_hash[%d]: %lx\n", SYMVAL_HASH,
                 (ulong)&st->symval_hash[0]);
@@ -2422,11 +3102,11 @@ dump_symbol_table(void)
 		if (SYMNAME_HASH % 6)
 			fprintf(fp, "\n");
 	}
-	fprintf(fp, "           namespace: ");
-	fprintf(fp, "address: %lx  ", (ulong)st->namespace.address);
-	fprintf(fp, "index: %ld  ", st->namespace.index); 
-	fprintf(fp, "size: %ld  ", (ulong)st->namespace.size);
-	fprintf(fp, "cnt: %ld\n", st->namespace.cnt);
+	fprintf(fp, "    symbol_namespace: ");
+	fprintf(fp, "address: %lx  ", (ulong)st->kernel_namespace.address);
+	fprintf(fp, "index: %ld  ", st->kernel_namespace.index); 
+	fprintf(fp, "size: %ld  ", (ulong)st->kernel_namespace.size);
+	fprintf(fp, "cnt: %ld\n", st->kernel_namespace.cnt);
 	fprintf(fp, " ext_module_symtable: %lx\n", 
 		(ulong)st->ext_module_symtable);
 	fprintf(fp, "   ext_module_symend: %lx\n", 
@@ -2469,12 +3149,20 @@ dump_symbol_table(void)
 			fprintf(fp, "%sMOD_INITRD", others++ ? "|" : "");
 		if (lm->mod_flags & MOD_NOPATCH)
 			fprintf(fp, "%sMOD_NOPATCH", others++ ? "|" : "");
+		if (lm->mod_flags & MOD_INIT)
+			fprintf(fp, "%sMOD_INIT", others++ ? "|" : "");
+		if (lm->mod_flags & MOD_DO_READNOW)
+			fprintf(fp, "%sMOD_DO_READNOW", others++ ? "|" : "");
 		fprintf(fp, ")\n");
 
         	fprintf(fp, "          mod_symtable: %lx\n",
 			(ulong)lm->mod_symtable);
         	fprintf(fp, "            mod_symend: %lx\n",
 			(ulong)lm->mod_symend);
+        	fprintf(fp, "     mod_init_symtable: %lx\n",
+			(ulong)lm->mod_init_symtable);
+        	fprintf(fp, "       mod_init_symend: %lx\n",
+			(ulong)lm->mod_init_symend);
 
                 fprintf(fp, "        mod_ext_symcnt: %ld\n",
                         lm->mod_ext_symcnt);
@@ -2523,10 +3211,32 @@ dump_symbol_table(void)
                         lm->mod_bss_start,
                         lm->mod_bss_start ?
                         lm->mod_bss_start - lm->mod_base : 0);
+		fprintf(fp, "         mod_init_size: %ld\n",
+			lm->mod_init_size);
 		fprintf(fp, "    mod_init_text_size: %ld\n",
 			lm->mod_init_text_size);
 		fprintf(fp, "   mod_init_module_ptr: %lx\n",
 			lm->mod_init_module_ptr);
+		if (lm->mod_percpu_size) {
+			fprintf(fp, "       mod_percpu_size: %lx\n", 
+				lm->mod_percpu_size);
+			fprintf(fp, "            mod_percpu: %lx - %lx\n", 
+				lm->mod_percpu, 
+				lm->mod_percpu + lm->mod_percpu_size);
+		} else {
+			if (lm->mod_percpu) {
+				fprintf(fp, 
+				    "       mod_percpu_size: (not loaded)\n");
+				fprintf(fp, 
+				    "            mod_percpu: %lx - (unknown)\n",
+					lm->mod_percpu);
+			} else {
+				fprintf(fp, 
+				    "       mod_percpu_size: (not used)\n");
+				fprintf(fp, 
+				    "            mod_percpu: (not used)\n");
+			}
+		}
 
 		fprintf(fp, "          mod_sections: %d\n", lm->mod_sections);
 		fprintf(fp, "      mod_section_data: %lx %s\n",
@@ -2554,9 +3264,14 @@ dump_symbol_table(void)
 	}
 
 	fprintf(fp, "\n");
-	fprintf(fp, "dwarf_eh_frame_file_offset: %llx\n", 
+	fprintf(fp, "   dwarf_eh_frame_file_offset: %llx\n", 
 		(unsigned long long)st->dwarf_eh_frame_file_offset);
-        fprintf(fp, "       dwarf_eh_frame_size: %ld\n", st->dwarf_eh_frame_size);
+	fprintf(fp, "          dwarf_eh_frame_size: %ld\n", st->dwarf_eh_frame_size);
+
+	fprintf(fp, "dwarf_debug_frame_file_offset: %llx\n", 
+		(unsigned long long)st->dwarf_debug_frame_file_offset);
+	fprintf(fp, "       dwarf_debug_frame_size: %ld\n", st->dwarf_debug_frame_size);
+
 	fprintf(fp, "\n");
 
 	sec = (asection **)st->sections;
@@ -2570,6 +3285,13 @@ dump_symbol_table(void)
 			(ulong)bfd_get_section_vma(st->bfd, section),
 			(ulong)bfd_section_size(st->bfd, section));
 	}
+	fprintf(fp, "\n           downsized: ");
+	if (st->downsized.name) {
+		for (ds = &st->downsized, cnt = 0; ds->name; ds = ds->next)
+			fprintf(fp, "%s%s", cnt++ ? ", " : "", ds->name);
+		fprintf(fp, "\n");
+	} else
+		fprintf(fp, "(none)\n");
 }
 
 
@@ -2660,6 +3382,26 @@ is_kernel(char *file)
 				goto bailout;
 			break;
 
+		case EM_ARM:
+			if (machine_type_mismatch(file, "ARM", NULL, 0))
+				goto bailout;
+			break;
+
+		case EM_PPC:
+			if (machine_type_mismatch(file, "PPC", NULL, 0))
+				goto bailout;
+			break;
+
+		case EM_MIPS:
+			if (machine_type_mismatch(file, "MIPS", NULL, 0))
+				goto bailout;
+			break;
+
+		case EM_SPARCV9:
+			if (machine_type_mismatch(file, "SPARC64", NULL, 0))
+				goto bailout;
+			break;
+
 		default:
 			if (machine_type_mismatch(file, "(unknown)", NULL, 0))
 				goto bailout;
@@ -2699,6 +3441,11 @@ is_kernel(char *file)
 				goto bailout;
 			break;
 
+		case EM_AARCH64:
+			if (machine_type_mismatch(file, "ARM64", NULL, 0))
+				goto bailout;
+			break;
+
 		default:
 			if (machine_type_mismatch(file, "(unknown)", NULL, 0))
 				goto bailout;
@@ -2710,6 +3457,124 @@ is_kernel(char *file)
 
 bailout:
 	return(is_bfd_format(file));
+}
+
+int 
+is_compressed_kernel(char *file, char **tmp)
+{
+	int len, type, fd;
+	char *tmpdir, *tempname;
+        unsigned char header[BUFSIZE];
+	char command[BUFSIZE];
+	char message[BUFSIZE];
+
+#define GZIP  (1)
+#define BZIP2 (2)
+
+#define FNAME (1 << 3)
+
+	if ((fd = open(file, O_RDONLY)) < 0)
+		return FALSE;
+
+	if (read(fd, header, BUFSIZE) != BUFSIZE) {
+		close(fd);
+		return FALSE;
+	}
+	close(fd);
+
+	type = 0;
+
+	if ((header[0] == 0x1f) && (header[1] == 0x8b) && (header[2] == 8)) {
+		if (!(header[3] & FNAME)) {
+		    	if (!(st->flags & FORCE_DEBUGINFO)) {
+				error(INFO, "%s: "
+				    "original filename unknown\n",
+					file);
+				error(CONT, 
+			    	    "Use \"-f %s\" on command line to prevent this message.\n\n",
+					file);
+			}
+		} else if (!STRNEQ((char *)&header[10], "vmlinux") && 
+		    !(st->flags & FORCE_DEBUGINFO)) {
+			error(INFO, "%s: compressed file name does not "
+			    "start with \"vmlinux\"\n", &header[10]);
+			error(CONT, 
+			    "Use \"-f %s\" on command line to override.\n\n",
+				file);
+			return FALSE;
+		}
+		type = GZIP;
+	}
+
+	if ((header[0] == 'B') && (header[1] == 'Z') && (header[2] == 'h')) {
+		if (!STRNEQ(basename(file), "vmlinux") &&
+		    !(st->flags & FORCE_DEBUGINFO)) {
+			error(INFO, "%s: compressed file name does not start "
+			    "with \"vmlinux\"\n", file);
+			error(CONT, 
+			    "Use \"-f %s\" on command line to override.\n\n",
+				file);
+			return FALSE;
+		}
+		type = BZIP2;
+	}
+
+	if (!type)
+		return FALSE;
+
+	if (!(tmpdir = getenv("TMPDIR")))
+		tmpdir = "/var/tmp";
+	len = strlen(tmpdir) + strlen(basename(file)) +
+		strlen("_XXXXXX") + 2;
+	if (!(tempname = (char *)malloc(len)))
+		return FALSE;
+	sprintf(tempname, "%s/%s_XXXXXX", tmpdir, basename(file));
+
+	fd = mkstemp(tempname);
+	if (fd < 0) {
+		perror("mkstemp");
+		free(tempname);
+		return FALSE;
+	} 
+	pc->cleanup = tempname;
+
+	sprintf(message, "uncompressing %s", file);
+	please_wait(message);
+	switch (type)
+	{
+	case GZIP:
+		sprintf(command, "%s -c %s > %s", 
+			file_exists("/bin/gunzip", NULL) ?
+			"/bin/gunzip" : "/usr/bin/gunzip",
+			file, tempname);
+		break;
+	case BZIP2:
+		sprintf(command, "%s -c %s > %s", 
+			file_exists("/bin/bunzip2", NULL) ?
+			"/bin/bunzip2" : "/usr/bin/bunzip2",
+			file, tempname);
+		break;
+	}
+	if (system(command) < 0) {
+		please_wait_done();
+		error(INFO, "%s of %s failed\n", 
+			type == GZIP ? "gunzip" : "bunzip2", file);
+		free(tempname);
+		return FALSE;
+	}
+	please_wait_done();
+
+	if (is_bfd_format(tempname) && is_kernel(tempname)) {
+		*tmp = tempname;
+		return TRUE;
+	}
+
+	unlink(tempname);
+	close(fd);
+	free(tempname);
+	pc->cleanup = NULL;
+
+	return FALSE;
 }
 
 int
@@ -2748,12 +3613,28 @@ is_shared_object(char *file)
 		switch (swap16(elf32->e_machine, swap))
 		{
 		case EM_386:
-			if (machine_type("X86"))
+			if (machine_type("X86") || machine_type("ARM") ||
+			    machine_type("MIPS"))
 				return TRUE;
 			break;
 
 		case EM_S390:
 			if (machine_type("S390"))
+				return TRUE;
+			break;
+
+		case EM_ARM:
+			if (machine_type("ARM"))
+				return TRUE;
+			break;
+
+		case EM_MIPS:
+			if (machine_type("MIPS"))
+				return TRUE;
+			break;
+
+		case EM_PPC:
+			if (machine_type("PPC"))
 				return TRUE;
 			break;
 		}
@@ -2779,12 +3660,22 @@ is_shared_object(char *file)
 			break;
 
 		case EM_X86_64:
-			if (machine_type("X86_64")) 
+			if (machine_type("X86_64") || machine_type("ARM64")) 
 				return TRUE;
 			break;
 
 		case EM_S390:
 			if (machine_type("S390X"))
+				return TRUE;
+			break;
+
+		case EM_AARCH64:
+			if (machine_type("ARM64"))
+				return TRUE;
+			break;
+
+		case EM_SPARCV9:
+			if (machine_type("SPARC64"))
 				return TRUE;
 			break;
 		}
@@ -2806,6 +3697,7 @@ int
 select_namelist(char *new)
 {
 	struct stat stat1, stat2;
+	char *namep;
 
 	if (pc->server_namelist) {
         	pc->namelist_debug = new;
@@ -2819,6 +3711,11 @@ select_namelist(char *new)
 
 	if (stat1.st_size > stat2.st_size) {
 		pc->namelist_debug = pc->namelist;
+		if (pc->namelist_orig) {
+			namep = pc->namelist_debug_orig;
+			pc->namelist_debug_orig = pc->namelist_orig;
+			pc->namelist_orig = namep;
+		}
 		pc->namelist = new;		
 	} else if (stat2.st_size > stat1.st_size) 
 		pc->namelist_debug = new;
@@ -2893,10 +3790,10 @@ not_system_map:
 static int
 is_bfd_format(char *filename) 
 {
-#if defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
-        struct bfd *bfd;
-#else
+#ifdef GDB_5_3
         struct _bfd *bfd;
+#else
+        struct bfd *bfd;
 #endif
         char **matching;
 
@@ -2915,10 +3812,10 @@ is_bfd_format(char *filename)
 static int
 is_binary_stripped(char *filename)
 {
-#if defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
-        struct bfd *bfd;
-#else
+#ifdef GDB_5_3
         struct _bfd *bfd;
+#else
+        struct bfd *bfd;
 #endif
 	int number_of_symbols;
 
@@ -3025,8 +3922,10 @@ cmd_sym(void)
 			name = NULL;
 			multiples = 0;
 			sp = NULL;
+			show_flags &= ~SHOW_MODULE;
 
-			if (hexadecimal(args[optind], 0)) {
+			if (clean_arg() && 
+			    (!symbol_exists(args[optind]) && hexadecimal(args[optind], 0))) {
 				errflag = 0;
 				value = htol(args[optind], RETURN_ON_ERROR,
 					&errflag);
@@ -3035,6 +3934,9 @@ cmd_sym(void)
 						args[optind]);
 				} else if ((sp = value_search(value, &offset))){
 					name = sp->name;
+					if (module_symbol(sp->value, NULL, NULL,
+					    NULL, 0))
+						show_flags |= SHOW_MODULE;
 					if (prev && 
 					    (spp = prev_symbol(NULL, sp))) 
 						show_symbol(spp, 0, show_flags);
@@ -3058,6 +3960,9 @@ cmd_sym(void)
 				if ((sp = symbol_search(args[optind]))) {
 					multiples = symbol_name_count(sp->name);
 do_multiples:
+					if (module_symbol(sp->value, NULL, NULL,
+					    NULL, 0))
+						show_flags |= SHOW_MODULE;
 					name = sp->name;
 					if (prev && 
 					    (spp = prev_symbol(NULL, sp)))
@@ -3099,6 +4004,11 @@ show_symbol(struct syment *sp, ulong offset, ulong show_flags)
 	char buf[BUFSIZE];
 	char *p1;
 	ulong radix;
+	struct load_module *lm;
+
+	lm = NULL;
+	if (CRASHDEBUG(1))
+		show_flags |= SHOW_LINENUM;
 
 	switch (show_flags & (SHOW_HEX_OFFS|SHOW_DEC_OFFS))
 	{
@@ -3112,7 +4022,6 @@ show_symbol(struct syment *sp, ulong offset, ulong show_flags)
 		break;
 	}
 
-
 	if (MODULE_START(sp)) {
 		p1 = sp->name + strlen("_MODULE_START_");
 		fprintf(fp, "%lx (%c) (%s module)", sp->value, sp->type, p1);
@@ -3121,24 +4030,27 @@ show_symbol(struct syment *sp, ulong offset, ulong show_flags)
 				offset);
 		fprintf(fp, "\n");
 		return;
-	}
+	} else if (show_flags & SHOW_MODULE)
+		module_symbol(sp->value, NULL, &lm, NULL, 0);
 
         if (offset)
                 fprintf(fp, (radix == 16) ?
-			"%lx (%c) %s+0x%lx  " : "%lx (%c) %s+%ld  ", 
+			"%lx (%c) %s+0x%lx" : "%lx (%c) %s+%ld", 
 			sp->value+offset, sp->type, sp->name, offset);
         else
-                fprintf(fp, "%lx (%c) %s  ", sp->value, sp->type, sp->name);
+                fprintf(fp, "%lx (%c) %s", sp->value, sp->type, sp->name);
+
+	if (lm)
+		fprintf(fp, " [%s]", lm->mod_name);
 
         if (is_kernel_text(sp->value+offset) && 
 	    (show_flags & SHOW_LINENUM))
-                fprintf(fp, "%s", 
+                fprintf(fp, " %s", 
 			get_line_number(sp->value+offset, buf, TRUE));
 
 	if (show_flags & SHOW_SECTION)
-                fprintf(fp, "[%s]", get_section(sp->value+offset, buf));
+                fprintf(fp, " [%s]", get_section(sp->value+offset, buf));
 		
-
 	fprintf(fp, "\n");
 }
 
@@ -3148,22 +4060,25 @@ show_symbol(struct syment *sp, ulong offset, ulong show_flags)
  *  any machine-dependent line_number_hooks reference.
  */
 char *
-get_line_number(ulong addr, char *buf, int strip_usr_src)
+get_line_number(ulong addr, char *buf, int reserved)
 {
 	char *p;
 	struct gnu_request request, *req;
 	struct line_number_hook *lnh;
+	struct syment *sp;
 	char bldbuf[BUFSIZE], *name;
 	struct load_module *lm;
 
 	buf[0] = NULLCHAR;
-	if (!is_kernel_text(addr) || GDB_PATCHED()) 
+
+	if (NO_LINE_NUMBERS() || !is_kernel_text(addr))
 		return(buf);
 
 	if (module_symbol(addr, NULL, &lm, NULL, 0)) {
 		if (!(lm->mod_flags & MOD_LOAD_SYMS))
 			return(buf);
-	}
+	} else if (kt->flags2 & KASLR)
+		addr -= (kt->relocate * -1);
 
 	if ((lnh = machdep->line_number_hooks)) {
         	name = closest_symbol(addr);
@@ -3184,14 +4099,13 @@ get_line_number(ulong addr, char *buf, int strip_usr_src)
 		req->command = GNU_GET_LINE_NUMBER;
 		req->addr = addr;
 		req->buf = buf;
+		if ((sp = value_search(addr, NULL)))
+			req->name = sp->name;
 		gdb_interface(req);
 	}
 
-	if (strip_usr_src && STRNEQ(buf, "/usr/src")) {
-		p = buf + strlen("/usr/src");
-		strcpy(buf, "..");
-		strcpy(&buf[2], p);
-	}
+	while ((p = strstr(buf, "//")))
+		shift_string_left(p+1, 1); 
 
 	return(buf);
 }
@@ -3270,7 +4184,7 @@ symbol_query(char *s, char *print_pad, struct syment **spp)
 	int i;
         struct syment *sp, *sp_end;
 	struct load_module *lm;
-	int cnt;
+	int cnt, search_init;
 
 	cnt = 0;
 
@@ -3287,8 +4201,12 @@ symbol_query(char *s, char *print_pad, struct syment **spp)
 		}
 	}
 
+	search_init = FALSE;
+
 	for (i = 0; i < st->mods_installed; i++) {
 		lm = &st->load_modules[i];
+		if (lm->mod_flags & MOD_INIT)
+			search_init = TRUE;
 		sp = lm->mod_symtable;
 		sp_end = lm->mod_symend;
 
@@ -3300,7 +4218,8 @@ symbol_query(char *s, char *print_pad, struct syment **spp)
 				if (print_pad) {
 					if (strlen(print_pad))
 						fprintf(fp, "%s", print_pad);
-					show_symbol(sp, 0, SHOW_RADIX());
+					show_symbol(sp, 0, 
+						SHOW_RADIX()|SHOW_MODULE);
 				}
 				if (spp)
 					*spp = sp;
@@ -3308,7 +4227,35 @@ symbol_query(char *s, char *print_pad, struct syment **spp)
 			}
 		}
 	}
+
+	if (!search_init)
+		return(cnt);
 	
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		if (!lm->mod_init_symtable)
+			continue;
+		sp = lm->mod_init_symtable;
+		sp_end = lm->mod_init_symend;
+
+		for ( ; sp < sp_end; sp++) {
+			if (MODULE_START(sp))
+				continue;
+
+			if (strstr(sp->name, s)) {
+				if (print_pad) {
+					if (strlen(print_pad))
+						fprintf(fp, "%s", print_pad);
+					show_symbol(sp, 0, 
+						SHOW_RADIX()|SHOW_MODULE);
+				}
+				if (spp)
+					*spp = sp;
+				cnt++;
+			}
+		}
+	}
+
 	return(cnt);
 }
 
@@ -3322,7 +4269,7 @@ symbol_search(char *s)
 	int i;
         struct syment *sp_hashed, *sp, *sp_end;
 	struct load_module *lm;
-	int pseudos;
+	int pseudos, search_init;
 
 	sp_hashed = symname_hash_search(s);
 
@@ -3332,20 +4279,43 @@ symbol_search(char *s)
         }
 
 	pseudos = (strstr(s, "_MODULE_START_") || strstr(s, "_MODULE_END_"));
+	search_init = FALSE;
 
         for (i = 0; i < st->mods_installed; i++) {
                 lm = &st->load_modules[i];
+		if (lm->mod_flags & MOD_INIT)
+			search_init = TRUE;
 		sp = lm->mod_symtable;
                 sp_end = lm->mod_symend;
 
-                for ( ; sp < sp_end; sp++) {
+                for ( ; sp <= sp_end; sp++) {
                 	if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
                         	continue;
-
                 	if (STREQ(s, sp->name))
                         	return(sp);
                 }
         }
+
+	if (!search_init)
+		return((struct syment *)NULL);
+
+	pseudos = (strstr(s, "_MODULE_INIT_START_") || strstr(s, "_MODULE_INIT_END_"));
+
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		if (!lm->mod_init_symtable)
+			continue;
+		sp = lm->mod_init_symtable;
+		sp_end = lm->mod_init_symend;
+
+		for ( ; sp < sp_end; sp++) {
+			if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
+				continue;
+
+			if (STREQ(s, sp->name))
+				return(sp);
+		}
+	}
 
         return((struct syment *)NULL);
 }
@@ -3353,13 +4323,13 @@ symbol_search(char *s)
 /*
  *  Count the number of instances of a symbol name.
  */
-static int
+int
 symbol_name_count(char *s)
 {
         int i;
         struct syment *sp, *sp_end;
         struct load_module *lm;
-        int count, pseudos;
+        int count, pseudos, search_init;
 
 	count = 0;
 
@@ -3371,9 +4341,12 @@ symbol_name_count(char *s)
         }
 
         pseudos = (strstr(s, "_MODULE_START_") || strstr(s, "_MODULE_END_"));
+	search_init = FALSE;
 
         for (i = 0; i < st->mods_installed; i++) {
                 lm = &st->load_modules[i];
+		if (lm->mod_flags & MOD_INIT)
+			search_init = TRUE;
                 sp = lm->mod_symtable;
                 sp_end = lm->mod_symend;
  
@@ -3386,20 +4359,41 @@ symbol_name_count(char *s)
                 }
         }
 
-        return(count);
+	if (!search_init)
+		return(count);
+
+	pseudos = (strstr(s, "_MODULE_INIT_START_") || strstr(s, "_MODULE_INIT_END_"));
+
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		if (!lm->mod_init_symtable)
+			continue;
+		sp = lm->mod_init_symtable;
+		sp_end = lm->mod_init_symend;
+
+		for ( ; sp < sp_end; sp++) {
+			if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
+				continue;
+
+			if (STREQ(s, sp->name))
+				count++;
+		}
+	}
+
+	return(count);
 }
 
 /*
  *  Return the syment of the next symbol with the same name of the input symbol.
  */
-static struct syment *
+struct syment *
 symbol_search_next(char *s, struct syment *spstart)
 {
 	int i;
         struct syment *sp, *sp_end;
 	struct load_module *lm;
 	int found_start;
-	int pseudos;
+	int pseudos, search_init;
 
 	found_start = FALSE;
 
@@ -3416,9 +4410,12 @@ symbol_search_next(char *s, struct syment *spstart)
         }
 
 	pseudos = (strstr(s, "_MODULE_START_") || strstr(s, "_MODULE_END_"));
+	search_init = FALSE;
 
         for (i = 0; i < st->mods_installed; i++) {
                 lm = &st->load_modules[i];
+		if (lm->mod_flags & MOD_INIT)
+			search_init = TRUE;
 		sp = lm->mod_symtable;
                 sp_end = lm->mod_symend;
 
@@ -3437,7 +4434,34 @@ symbol_search_next(char *s, struct syment *spstart)
                 }
         }
 
-        return((struct syment *)NULL);
+	if (!search_init)
+		return((struct syment *)NULL);
+
+	pseudos = (strstr(s, "_MODULE_INIT_START_") || strstr(s, "_MODULE_INIT_END_"));
+
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		if (!lm->mod_init_symtable)
+			continue;
+		sp = lm->mod_init_symtable;
+		sp_end = lm->mod_init_symend;
+
+		for ( ; sp < sp_end; sp++) {
+			if (!pseudos && MODULE_PSEUDO_SYMBOL(sp))
+				continue;
+
+			if (sp == spstart) {
+				found_start = TRUE;
+				continue;
+			} else if (!found_start)
+				continue;
+
+			if (STREQ(s, sp->name))
+				return(sp);
+		}
+	}
+
+	return((struct syment *)NULL);
 }
 
 /*
@@ -3479,9 +4503,9 @@ module_symbol(ulong value,
         int i;
 	struct load_module *lm;
 	struct syment *sp;
-	long mcnt;
 	char buf[BUFSIZE];
 	ulong offs, offset;
+	ulong base, end;
 
 	if (NO_MODULES())
 		return FALSE;
@@ -3491,17 +4515,27 @@ module_symbol(ulong value,
         if ((radix != 10) && (radix != 16))
                 radix = 16;
 
-        mcnt = 0;
 	for (i = 0; i < st->mods_installed; i++) {
 		lm = &st->load_modules[i];
 
-		if ((value >= lm->mod_base) && 
-		    (value < (lm->mod_base + lm->mod_size))) {
+		if (IN_MODULE(value, lm)) {
+			base = lm->mod_base;
+			end = lm->mod_base + lm->mod_size;
+		} else if (IN_MODULE_INIT(value, lm)) {
+			base = lm->mod_init_module_ptr;
+			end = lm->mod_init_module_ptr + lm->mod_init_size;
+		} else if (IN_MODULE_PERCPU(value, lm)) {
+			base = lm->mod_percpu;
+			end = lm->mod_percpu + lm->mod_percpu_size;
+		} else
+			continue;
+
+		if ((value >= base) && (value < end)) {
 			if (lmp) 
 				*lmp = lm;
 
 			if (name) {
-				offs = value - lm->mod_base;
+				offs = value - base;
         			if ((sp = value_search(value, &offset))) {
                 			if (offset)
                         			sprintf(buf, radix == 16 ? 
@@ -3530,56 +4564,38 @@ module_symbol(ulong value,
 	return FALSE;
 }
 
-/*
- *  Return the syment of the symbol closest to the value, along with
- *  the offset from the symbol value if requested.
- */
 struct syment *
-value_search(ulong value, ulong *offset)
+value_search_module(ulong value, ulong *offset)
 {
 	int i;
         struct syment *sp, *sp_end, *spnext, *splast;
 	struct load_module *lm;
+	int search_init_sections, search_init;
 
-        if (!in_ksymbol_range(value))
-                return((struct syment *)NULL);
+	search_init = FALSE;
+	search_init_sections = 0;
 
-	if ((sp = machdep->value_to_symbol(value, offset)))
-		return sp;
+        for (i = 0; i < st->mods_installed; i++) {
+                if (st->load_modules[i].mod_flags & MOD_INIT)
+			search_init_sections++;
+	}
 
-	if (IS_VMALLOC_ADDR(value)) 
-		goto check_modules;
-
-	if ((sp = symval_hash_search(value)) == NULL)
-		sp = st->symtable;
- 
-        for ( ; sp < st->symend; sp++) {
-                if (value == sp->value) {
-#ifdef GDB_7_0
-			if (STRNEQ(sp->name, ".text.")) {
-				spnext = sp+1;
-				if (spnext->value == value)
-					sp = spnext;
-			}
-#endif
-                        if (offset) 
-				*offset = 0;
-                        return((struct syment *)sp);
-                }
-                if (sp->value > value) {
-			if (offset)
-                        	*offset = value - ((sp-1)->value);
-                        return((struct syment *)(sp-1));
-                }
-        }
-
-check_modules:
+retry:
         for (i = 0; i < st->mods_installed; i++) {
                 lm = &st->load_modules[i];
-		sp = lm->mod_symtable;
-                sp_end = lm->mod_symend;
 
-		if (sp->value > value)  /* invalid -- between modules */
+		if (search_init) {
+			if (lm->mod_init_symtable) {
+				sp = lm->mod_init_symtable;
+				sp_end = lm->mod_init_symend;
+			} else
+				continue;
+		} else {
+			sp = lm->mod_symtable;
+			sp_end = lm->mod_symend;
+		}
+
+		if (sp->value > value)   /* invalid -- between modules */
 			break;
 
 	       /*
@@ -3588,10 +4604,20 @@ check_modules:
                 *  when they have unique values.
 		*/
 		splast = NULL;
-                for ( ; sp < sp_end; sp++) {
-                	if (value == sp->value) {
-				if (MODULE_START(sp)) {
-					spnext = sp+1;
+                for ( ; sp <= sp_end; sp++) {
+			if (machine_type("ARM64") &&
+			    IN_MODULE_PERCPU(sp->value, lm) &&
+			    !IN_MODULE_PERCPU(value, lm)) 
+				continue;       
+
+			if (value == sp->value) {
+				if (MODULE_END(sp) || MODULE_INIT_END(sp))
+					break;
+
+				if (MODULE_PSEUDO_SYMBOL(sp)) {
+					spnext = sp + 1;
+					if (MODULE_PSEUDO_SYMBOL(spnext))
+						continue;
 					if (spnext->value == value)
 						sp = spnext;
 				}
@@ -3630,7 +4656,84 @@ check_modules:
                 }
         }
 
+	if (search_init_sections) {
+		if (!search_init) {
+			search_init = TRUE;
+			goto retry;
+		}
+	}
+
         return((struct syment *)NULL);
+}
+
+/*
+ *  Return the syment of the symbol closest to the value, along with
+ *  the offset from the symbol value if requested.
+ */
+struct syment *
+value_search(ulong value, ulong *offset)
+{
+        struct syment *sp, *spnext;
+
+        if (!in_ksymbol_range(value))
+                return((struct syment *)NULL);
+
+	if ((sp = machdep->value_to_symbol(value, offset)))
+		return sp;
+
+	if (IS_VMALLOC_ADDR(value))
+		goto check_modules;
+
+	if ((sp = symval_hash_search(value)) == NULL)
+		sp = st->symtable;
+ 
+        for ( ; sp < st->symend; sp++) {
+                if (value == sp->value) {
+#if !defined(GDB_5_3) && !defined(GDB_6_0) && !defined(GDB_6_1)
+			if (STRNEQ(sp->name, ".text.")) {
+				spnext = sp+1;
+				if (spnext->value == value)
+					sp = spnext;
+			}
+#endif
+                        if (offset) 
+				*offset = 0;
+
+			/* 
+			 *  Avoid "SyS" and "compat_SyS" kernel syscall 
+			 *  aliases by returning the real symbol name,
+			 *  which is the next symbol in the list.
+			 */
+			if ((STRNEQ(sp->name, "SyS_") || 
+			     STRNEQ(sp->name, "compat_SyS_")) &&
+			    ((spnext = sp+1) < st->symend) &&
+			    (spnext->value == value))
+				sp = spnext;
+
+			/*
+			 *  If any of the special text region starting address 
+			 *  delimiters declared in vmlinux.lds.S match the 
+			 *  first "real" text symbol in the region, return
+			 *  that (next) one instead.
+			 */ 
+			if (strstr_rightmost(sp->name, "_text_start") &&
+			    ((spnext = sp+1) < st->symend) &&
+			    (spnext->value == value))
+				sp = spnext;
+
+                        return((struct syment *)sp);
+                }
+                if (sp->value > value) {
+			if (offset)
+                        	*offset = value - ((sp-1)->value);
+                        return((struct syment *)(sp-1));
+                }
+        }
+
+check_modules:
+	sp = value_search_module(value, offset);
+
+	return sp;
 }
 
 ulong
@@ -3656,7 +4759,7 @@ highest_bss_symbol(void)
 struct syment *
 value_search_base_kernel(ulong value, ulong *offset)
 {
-        struct syment *sp, *splast;
+        struct syment *sp;
 
         if (value < st->symtable[0].value)
         	return((struct syment *)NULL);
@@ -3675,7 +4778,6 @@ value_search_base_kernel(ulong value, ulong *offset)
                         	*offset = value - ((sp-1)->value);
                         return((struct syment *)(sp-1));
                 }
-		splast = sp;
         }
 
 	/* 
@@ -3796,7 +4898,7 @@ struct syment *
 next_symbol(char *symbol, struct syment *sp_in)
 {
 	int i;
-	int found;
+	int found, search_init;
         struct syment *sp, *sp_end;
 	struct load_module *lm;
 	char buf[BUFSIZE], *p1;
@@ -3815,8 +4917,12 @@ next_symbol(char *symbol, struct syment *sp_in)
 			}
 	        }
 	
+		search_init = FALSE;
+
 	        for (i = 0; i < st->mods_installed; i++) {
 	                lm = &st->load_modules[i];
+			if (lm->mod_flags & MOD_INIT)
+				search_init = TRUE;
 	                sp = lm->mod_symtable;
 	                sp_end = lm->mod_symend;
 	
@@ -3831,6 +4937,23 @@ next_symbol(char *symbol, struct syment *sp_in)
 						continue;
                                 	return sp;
 				}
+	                }
+	        }
+
+	        for (i = 0; search_init && (i < st->mods_installed); i++) {
+	                lm = &st->load_modules[i];
+			if (!lm->mod_init_symtable)
+				continue;
+	                sp = lm->mod_init_symtable;
+	                sp_end = lm->mod_init_symend;
+	
+	                for ( ; sp < sp_end; sp++) {
+	                        if (MODULE_PSEUDO_SYMBOL(sp))
+	                                continue;
+                       		if (sp == sp_in) 
+                                	found = TRUE;
+                        	else if (found)
+                                	return sp;
 	                }
 	        }
 
@@ -3883,7 +5006,7 @@ next_symbol(char *symbol, struct syment *sp_in)
 struct syment *
 prev_symbol(char *symbol, struct syment *sp_in)
 {
-	int i;
+	int i, search_init;
         struct syment *sp, *sp_end, *sp_prev;
 	char buf[BUFSIZE], *p1;
 	struct load_module *lm;
@@ -3899,8 +5022,12 @@ prev_symbol(char *symbol, struct syment *sp_in)
 			sp_prev = sp;
                 }
 
+		search_init = FALSE;
+
                 for (i = 0; i < st->mods_installed; i++) {
                         lm = &st->load_modules[i];
+			if (lm->mod_flags & MOD_INIT)
+				search_init = TRUE;
                         sp = lm->mod_symtable;
                         sp_end = lm->mod_symend;
 
@@ -3915,6 +5042,23 @@ prev_symbol(char *symbol, struct syment *sp_in)
                                                 sp_prev = sp;
                                 } else
                                 	sp_prev = sp;
+                        }
+                }
+
+                for (i = 0; search_init && (i < st->mods_installed); i++) {
+                        lm = &st->load_modules[i];
+                        if (!lm->mod_init_symtable)
+				continue;
+                        sp = lm->mod_init_symtable;
+                        sp_end = lm->mod_init_symend;
+
+                        for ( ; sp < sp_end; sp++) {
+                                if (MODULE_PSEUDO_SYMBOL(sp))
+                                        continue;
+                                if (sp == sp_in)
+                                        return sp_prev;
+
+                               	sp_prev = sp;
                         }
                 }
 
@@ -4023,6 +5167,16 @@ symbol_value_module(char *symbol, char *module)
 			if (STREQ(symbol, sp->name))
 				return(sp->value);
 		}
+
+		if (lm->mod_init_symtable) {
+			sp = lm->mod_init_symtable;
+			sp_end = lm->mod_init_symend;
+	
+			for ( ; sp < sp_end; sp++) {
+				if (STREQ(symbol, sp->name))
+					return(sp->value);
+			}
+		}
 	}
 
 	return 0;
@@ -4071,6 +5225,16 @@ symbol_exists(char *symbol)
                 	if (STREQ(symbol, sp->name))
                         	return(TRUE);
                 }
+
+		if (lm->mod_init_symtable) {
+			sp = lm->mod_init_symtable;
+			sp_end = lm->mod_init_symend;
+	
+			for ( ; sp < sp_end; sp++) {
+				if (STREQ(symbol, sp->name))
+					return(TRUE);
+			}
+		}
 	}
 
         return(FALSE);
@@ -4097,16 +5261,15 @@ per_cpu_symbol_search(char *symbol)
 			return sp;
 		new = symbol + strlen("per_cpu__");
 		if ((sp = symbol_search(new))) {
-			if ((sp->type == 'V') ||
-			    ((sp->value >= st->__per_cpu_start) && 
-		    	    (sp->value < st->__per_cpu_end)))
+			if ((sp->type == 'V') || (is_percpu_symbol(sp)))
+				return sp;
+			if ((sp->type == 'd') &&
+			    (st->__per_cpu_start == st->__per_cpu_end))
 				return sp;
 		}
 	} else {
 		if ((sp = symbol_search(symbol))) {
-			if ((sp->type == 'V') ||
-			    ((sp->value >= st->__per_cpu_start) && 
-		    	    (sp->value < st->__per_cpu_end)))
+			if ((sp->type == 'V') || (is_percpu_symbol(sp)))
 				return sp;
 		}
 
@@ -4133,6 +5296,15 @@ kernel_symbol_exists(char *symbol)
                 return TRUE;
 	else
         	return FALSE;
+}
+
+/*
+ *  Similar to above, but return the syment of the kernel symbol.
+ */
+struct syment *
+kernel_symbol_search(char *symbol)
+{
+	return symname_hash_search(symbol);
 }
 
 /*
@@ -4179,7 +5351,19 @@ get_syment_array(char *symbol, struct syment **sp_array, int max)
                                 cnt++;
 			}
                 }
-        }
+
+		if (lm->mod_init_symtable) {
+                	sp = lm->mod_init_symtable;
+                	sp_end = lm->mod_init_symend;
+			for ( ; sp < sp_end; sp++) {
+				if (STREQ(symbol, sp->name)) {
+					if (max && (cnt < max))
+						sp_array[cnt] = sp;
+					cnt++;
+				}
+			}
+		}
+	}
 
         return cnt;
 }
@@ -4349,7 +5533,8 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
 
 	FREEBUF(req);
 
-        if (dm && (dm != MEMBER_SIZE_REQUEST) && (dm != MEMBER_TYPE_REQUEST)) {
+        if (dm && (dm != MEMBER_SIZE_REQUEST) && (dm != MEMBER_TYPE_REQUEST) &&
+	    (dm != STRUCT_SIZE_REQUEST)) {
                 dm->type = type_found;
                 dm->size = size;
 		dm->member_size = member_size;
@@ -4371,35 +5556,57 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
 		return member_size;
 	else if (dm == MEMBER_TYPE_REQUEST)
 		return member_typecode;
-        else if (member)
-		return offset;
-	else
+	else if (dm == STRUCT_SIZE_REQUEST) {
+		if ((req->typecode == TYPE_CODE_STRUCT) || 
+		    (req->typecode == TYPE_CODE_UNION) ||
+		     req->is_typedef)
+			return size;
+		else
+			return -1;
+        } else if (member) {
+		if ((req->typecode == TYPE_CODE_STRUCT) || 
+		    (req->typecode == TYPE_CODE_UNION))
+			return offset;
+		else
+			return -1;
+	} else
                 return size;
 }
 
 /*
  *  Determine the offset of a member in an anonymous union
- *  in a structure.
+ *  in a structure or union.
  */
 static long
 anon_member_offset(char *name, char *member)
 {
-	int c;
 	char buf[BUFSIZE];
-	char *arglist[MAXARGS];
 	ulong value;
+	int type;
 
 	value = -1;
-	sprintf(buf, "print &((struct %s *)0x0)->%s", name, member);
-
-	open_tmpfile();
-	if (gdb_pass_through(buf, fp, GNU_RETURN_ON_ERROR)) {
-		rewind(pc->tmpfile);
-		if (fgets(buf, BUFSIZE, pc->tmpfile) &&
-	    	    (c = parse_line(strip_linefeeds(buf), arglist)))
-			value = stol(arglist[c-1], RETURN_ON_ERROR|QUIET, NULL);
+	type = STRUCT_REQUEST;
+	sprintf(buf, "printf \"%%p\", &((struct %s *)0x0)->%s", name, member);
+	open_tmpfile2();
+retry:
+	if (gdb_pass_through(buf, pc->tmpfile2, GNU_RETURN_ON_ERROR)) {
+		rewind(pc->tmpfile2);
+		if (fgets(buf, BUFSIZE, pc->tmpfile2)) {
+			if (hexadecimal(buf, 0))
+				value = htol(buf, RETURN_ON_ERROR|QUIET, NULL);
+			else if (STRNEQ(buf, "(nil)"))
+				value = 0;
+		}
 	}
-	close_tmpfile();
+
+	if ((value == -1) && (type == STRUCT_REQUEST)) {
+		type = UNION_REQUEST;
+		sprintf(buf, "printf \"%%p\", &((union %s *)0x0)->%s", name, member);
+		rewind(pc->tmpfile2);
+		goto retry;
+	}
+
+	close_tmpfile2();
 
 	return value;
 }
@@ -4428,6 +5635,7 @@ get_symbol_type(char *name, char *member, struct gnu_request *caller_req)
 	req->name = name;
 	req->member = member;
 	req->flags = GNU_RETURN_ON_ERROR; 
+	req->fp = pc->nullfp;
 
         gdb_interface(req);
 
@@ -4447,6 +5655,50 @@ get_symbol_type(char *name, char *member, struct gnu_request *caller_req)
 	return(typecode);
 }
 
+int
+get_symbol_length(char *symbol)
+{
+	struct gnu_request *req;
+	int len;
+
+	req = (struct gnu_request *)GETBUF(sizeof(struct gnu_request));
+	if (get_symbol_type(symbol, NULL, req) == TYPE_CODE_UNDEF)
+		error(FATAL, "cannot determine length of symbol: %s\n",
+			symbol);
+
+	len = (int)req->length;
+	FREEBUF(req);
+
+	return len;
+}
+
+/*
+ *  Initialize the caller's restore_radix, and if valid,
+ *  temporarily override the current output radix.
+ */
+void
+set_temporary_radix(unsigned int radix, unsigned int *restore_radix)
+{
+	*restore_radix = *gdb_output_radix;
+
+	if ((radix == 10) || (radix == 16)) {
+		*gdb_output_radix = radix; \
+		*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
+	}
+}
+
+/*
+ *  Restore the output radix to the current/default value saved
+ *  by the caller.
+ */
+void
+restore_current_radix(unsigned int restore_radix)
+{
+	if ((restore_radix == 10) || (restore_radix == 16)) {
+		*gdb_output_radix = restore_radix;
+		*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
+	}
+}
 
 /*
  *  Externally available routine to dump a structure at an address.
@@ -4462,18 +5714,11 @@ dump_struct(char *s, ulong addr, unsigned radix)
 	if ((len = STRUCT_SIZE(s)) < 0)
 		error(FATAL, "invalid structure name: %s\n", s);
 
-	if (radix) {
-		restore_radix = *gdb_output_radix; 
-		*gdb_output_radix = radix;
-		*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-	}
+	set_temporary_radix(radix, &restore_radix);
 
         print_struct(s, addr);
 
-	if (radix) {
-		*gdb_output_radix = restore_radix;
-		*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-	}
+	restore_current_radix(restore_radix);
 }
 
 /*
@@ -4503,27 +5748,20 @@ dump_struct_member(char *s, ulong addr, unsigned radix)
 		FREEBUF(buf);
                 error(FATAL, "invalid structure name: %s\n", dm->name);
 	}
-	if (!MEMBER_EXISTS(dm->name, dm->member)) {
-		FREEBUF(buf);
-                error(FATAL, "invalid structure member name: %s\n", 
-			dm->member);
-	}
  
-        if (radix) {
-                restore_radix = *gdb_output_radix; 
-                *gdb_output_radix = radix;
-                *gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-        }
+	set_temporary_radix(radix, &restore_radix);
                 
         open_tmpfile();
         print_struct(dm->name, addr);
-        parse_for_member(dm, PARSE_FOR_DATA);
+
+	if (MEMBER_EXISTS(dm->name, dm->member))
+		parse_for_member(dm, PARSE_FOR_DATA);
+	else
+		parse_for_member_extended(dm, PARSE_FOR_DATA);
+
         close_tmpfile();
                 
-        if (radix) {
-                *gdb_output_radix = restore_radix;
-                *gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-        }
+	restore_current_radix(restore_radix);
 
 	FREEBUF(buf);
 }
@@ -4543,18 +5781,11 @@ dump_union(char *s, ulong addr, unsigned radix)
         if ((len = UNION_SIZE(s)) < 0)
                 error(FATAL, "invalid union name: %s\n", s);
 
-        if (radix) {
-                restore_radix = *gdb_output_radix;
-                *gdb_output_radix = radix;
-		*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-        }
+	set_temporary_radix(radix, &restore_radix);
 
         print_union(s, addr);
 
-        if (radix) {
-                *gdb_output_radix = restore_radix;
-		*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-	}
+	restore_current_radix(restore_radix);
 }
 
 /*
@@ -4596,40 +5827,333 @@ cmd_pointer(void)
 	cmd_datatype_common(0);
 }
 
+static void
+print_struct_with_dereference(ulong addr, struct datatype_member *dm, ulong flags)
+{
+	int indent;
+	char *p1;
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
+	char buf3[BUFSIZE];
+	struct datatype_member datatype_member, *dm1;
+
+	dm1 = &datatype_member;
+
+	open_tmpfile();
+
+	if (flags & UNION_REQUEST)
+		print_union(dm->name, addr);
+	else if (flags & STRUCT_REQUEST)
+		print_struct(dm->name, addr);
+
+	rewind(pc->tmpfile);
+	while (fgets(buf1, BUFSIZE, pc->tmpfile)) {
+		indent = count_leading_spaces(buf1);
+		if ((indent != 2) || strstr(buf1, "{") || strstr(buf1, "}")) {
+			print_verbatim(pc->saved_fp, buf1);
+			continue;
+		}
+
+		sprintf(buf2, "%s.", dm->name);
+		strcpy(buf3, &buf1[2]);
+		p1 = strstr(buf3, " =");
+		*p1 = NULLCHAR;
+		strcat(buf2, buf3);
+
+		if ((arg_to_datatype(buf2, dm1, RETURN_ON_ERROR) == 2) &&
+		    dereference_pointer(addr, dm1, flags))
+			continue;
+
+		print_verbatim(pc->saved_fp, buf1);
+	}
+
+	close_tmpfile();
+}
+
+
+static int
+dereference_pointer(ulong addr, struct datatype_member *dm, ulong flags)
+{
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
+	char *typeptr, *member, *charptr, *voidptr, *p1, *sym;
+	int found, ptrptr, funcptr, typedef_is_ptr, use_symbol;
+	ulong target, value;
+
+	found = ptrptr = funcptr = typedef_is_ptr = use_symbol = FALSE;
+	member = GETBUF(strlen(dm->member)+4);
+	typeptr = charptr = voidptr = NULL;
+
+	open_tmpfile2();
+	whatis_datatype(dm->name, flags, pc->tmpfile2);
+
+	rewind(pc->tmpfile2);
+	while (fgets(buf1, BUFSIZE, pc->tmpfile2)) {
+		sprintf(member, " *%s;", dm->member);
+		if (strstr(buf1, member) && (buf1[4] != ' ')) {
+			typeptr = &buf1[4];
+			found++;
+			break;
+		}
+		sprintf(member, "**%s;", dm->member);
+		if (strstr(buf1, member) && (buf1[4] != ' ')) {
+			typeptr = &buf1[4];
+			found++;
+			ptrptr = TRUE;
+			break;
+		}
+		sprintf(member, "(*%s)(", dm->member);
+		if (strstr(buf1, member) && (buf1[4] != ' ')) {
+			typeptr = &buf1[4];
+			funcptr = TRUE;
+			found++;
+			break;
+		}
+                sprintf(member, " %s;", dm->member);
+                if (strstr(buf1, member) && (buf1[4] != ' ')) {
+                        typeptr = &buf1[4];
+                        typedef_is_ptr = TRUE;
+                        strcpy(buf2, typeptr);
+                        p1 = strstr(buf2, " ");
+                        *p1 = NULLCHAR;
+			if (datatype_exists(buf2) == TYPE_CODE_PTR) {
+                        	found++;
+                        	break;
+			}
+                }
+	}
+
+	close_tmpfile2();
+	FREEBUF(member);
+
+	if (!found) {
+		console("%s.%s: not found!\n", dm->name, dm->member);
+		return FALSE;
+	}
+
+	if (funcptr) {
+		p1 = strstr(buf1, ";");
+		*p1 = NULLCHAR;
+	} else if (ptrptr) {
+		p1 = strstr(buf1, "**");
+		*(p1+2) = NULLCHAR;
+		charptr = voidptr = NULL;
+        } else if (typedef_is_ptr) {
+                p1 = strstr(typeptr, " ");
+                *p1 = NULLCHAR;
+	} else {
+		p1 = strstr(buf1, "*");
+		*(p1+1) = NULLCHAR;
+		charptr = strstr(&buf1[4], "char *");
+		voidptr = strstr(&buf1[4], "void *");
+	}
+
+	console("%s.%s typeptr: %s ", 
+		dm->name, dm->member,
+		typeptr);
+	if (charptr)
+		console("[char *]");
+	else if (voidptr)
+		console("[void *]");
+	else if (funcptr)
+		console("[func *]");
+	else if (typedef_is_ptr)
+		console("[typedef is ptr]");
+	console("\n");
+
+	if (!readmem(addr + dm->member_offset, KVADDR, 
+	    &target, sizeof(void *), "target address",
+	    RETURN_ON_ERROR|QUIET)) {
+		error(INFO, "cannot access %s.%s %lx\n",
+			dm->name, dm->member,
+			addr + dm->member_offset);
+		return FALSE;
+	}
+
+	if ((sym = value_symbol(target))) {
+		switch (get_symbol_type(sym, NULL, NULL))
+		{
+		case TYPE_CODE_ARRAY:
+		case TYPE_CODE_UNION:
+		case TYPE_CODE_STRUCT:
+		case TYPE_CODE_INT:
+		case TYPE_CODE_PTR:
+			use_symbol = TRUE;
+			console("use_symbol: %s\n", sym); 
+			break;
+		}
+	}
+
+	if (funcptr) {
+		fprintf(pc->saved_fp, "  %s = 0x%lx\n  -> ", 
+			typeptr, target);
+		if (sym)
+			fprintf(pc->saved_fp, "<%s>\n", sym);
+		else if (target)
+			fprintf(pc->saved_fp, "(unknown)\n");
+		else
+			fprintf(pc->saved_fp, "NULL\n");
+		return TRUE;
+	}
+
+	if (charptr) {
+		fprintf(pc->saved_fp, "  %s%s = 0x%lx\n  -> ", typeptr, dm->member,
+			target);
+		if (sym)
+			fprintf(pc->saved_fp, "<%s> ", sym);
+		if (!target)
+			fprintf(pc->saved_fp, "NULL\n");
+		else if (!accessible(target) || !read_string(target, buf1, BUFSIZE-1))
+			fprintf(pc->saved_fp, "(not accessible)\n");
+		else 
+			fprintf(pc->saved_fp, "\"%s\"\n", buf1);
+		return TRUE;
+	}
+
+	if (voidptr && !use_symbol) {
+		fprintf(pc->saved_fp, "  %s%s = 0x%lx\n  -> ", typeptr, dm->member,
+			target);
+		if (sym)
+			fprintf(pc->saved_fp, "<%s>\n", sym);
+		else if (!target)
+			fprintf(pc->saved_fp, "NULL\n");
+		else if (voidptr)
+			fprintf(pc->saved_fp, "(unknown target type)\n");
+		return TRUE;
+	}
+
+	if (!target || !accessible(target)) {
+		fprintf(pc->saved_fp, "  %s%s%s = 0x%lx\n  -> ", typeptr, 
+			typedef_is_ptr ? " " : "", dm->member, target);
+		if (!target)
+			fprintf(pc->saved_fp, "NULL\n");
+		else
+			fprintf(pc->saved_fp, "(not accessible)\n");
+		return TRUE;
+	}
+
+	if (ptrptr) {
+		fprintf(pc->saved_fp, "  %s%s = 0x%lx\n  -> ", typeptr, dm->member,
+			target);
+		if (sym)
+			fprintf(pc->saved_fp, "<%s> ", sym);
+		if (!target || 
+		    !readmem(target, KVADDR, &value, sizeof(void *), 
+		    "target value", RETURN_ON_ERROR|QUIET))
+			fprintf(pc->saved_fp, "\n");
+		else 
+			fprintf(pc->saved_fp, "%lx\n", value);
+		return TRUE;
+	}
+
+	if (use_symbol)
+		sprintf(buf2, "p %s\n", sym);
+	else
+		sprintf(buf2, "p *((%s)(0x%lx))\n", typeptr, target);
+	console("gdb command: %s", buf2);
+
+	if (!typedef_is_ptr) {
+		p1 = strstr(typeptr, "*");
+		*(p1-1) = NULLCHAR;
+	} 
+
+	if (!datatype_exists(typeptr)) {
+		fprintf(pc->saved_fp, 
+		    "  %s %s%s = 0x%lx\n  -> (%s: no debuginfo data)\n", 
+			typeptr, typedef_is_ptr ? "" : "*", dm->member, target,
+			typeptr);
+		return TRUE;
+	}
+
+	open_tmpfile2();
+	if (!gdb_pass_through(buf2, pc->tmpfile2, GNU_RETURN_ON_ERROR)) {
+		console("gdb request failed: %s\n", buf2);
+		close_tmpfile2();
+		return FALSE;
+	}
+
+	fprintf(pc->saved_fp, "  %s %s%s = 0x%lx\n  -> ", typeptr, 
+		typedef_is_ptr ? "" : "*", dm->member, target);
+
+	rewind(pc->tmpfile2);
+	while (fgets(buf1, BUFSIZE, pc->tmpfile2)) {
+		if (buf1[0] == '$') {
+			if (sym)
+				fprintf(pc->saved_fp, "<%s> ", sym);
+			if (typedef_is_ptr || use_symbol) {
+				if (strstr(buf1, "(") && strstr(buf1, ")")) {
+					fprintf(pc->saved_fp, "\n");
+					break;
+				}
+			}
+			p1 = strstr(buf1, "=");
+			fprintf(pc->saved_fp, "%s", p1+2);
+		} else
+			fprintf(pc->saved_fp, "     %s", buf1);
+	}
+	
+	close_tmpfile2();
+
+	return TRUE;
+}
+
 static void 
 cmd_datatype_common(ulong flags)
 {
-	int i, c;
+	int c;
 	ulong addr, aflag;
+	char *cpuspec;
+	ulong *cpus;
 	struct syment *sp;
-	int rawdata;
-	long len;
 	ulong list_head_offset;
 	int count;
 	int argc_members;
 	int optind_save;
+	unsigned int radix, restore_radix;
         struct datatype_member datatype_member, *dm;
         char *separator;
         char *structname, *members;
         char *memberlist[MAXARGS];
+        char *typename;
 
         dm = &datatype_member;
 	count = 0xdeadbeef;
-	rawdata = 0;
 	aflag = addr = 0;
         list_head_offset = 0;
         argc_members = 0;
+	radix = restore_radix = 0;
 	separator = members = NULL;
+	cpuspec = NULL;
+	cpus = NULL;
 
-        while ((c = getopt(argcnt, args, "fuc:rvol:")) != EOF) {
+        while ((c = getopt(argcnt, args, "pxdhfuc:rvol:")) != EOF) {
                 switch (c)
 		{
+		case 'p':
+			flags |= DEREF_POINTERS;
+			break;
+
+		case 'd':
+			if (radix == 16)
+				error(FATAL, 
+				    "-d and -x are mutually exclusive\n");
+			radix = 10;
+			break;
+
+		case 'h':
+		case 'x':
+			if (radix == 10)
+				error(FATAL, 
+				    "-d and -x are mutually exclusive\n");
+			radix = 16;
+			break;
+
 		case 'c':
 			count = atoi(optarg);
 			break;
 
 		case 'r':
-			rawdata = 1;
+			flags |= SHOW_RAW_DATA;
 			break;
 
 		case 'v':
@@ -4675,8 +6199,7 @@ cmd_datatype_common(ulong flags)
         if ((count_chars(args[optind], ',')+1) > MAXARGS)
                 error(FATAL, "too many members in comma-separated list!\n");
 
-	if ((count_chars(args[optind], '.') > 1) ||
-	    (LASTCHAR(args[optind]) == ',') ||
+	if ((LASTCHAR(args[optind]) == ',') ||
 	    (LASTCHAR(args[optind]) == '.'))
 		error(FATAL, "invalid format: %s\n", args[optind]);
 
@@ -4689,11 +6212,22 @@ cmd_datatype_common(ulong flags)
 		if (aflag && (count != 0xdeadbeef))
 			error(FATAL, "too many arguments!\n");
 
+		if (!aflag) {
+			cpuspec = strchr(args[optind], ':');
+			if (cpuspec)
+				*cpuspec++ = NULLCHAR;
+		}
+
 		if (clean_arg() && IS_A_NUMBER(args[optind])) { 
 			if (aflag) 
 				count = stol(args[optind], 
 					FAULT_ON_ERROR, NULL);
-			else {
+			else if (cpuspec) {
+				if (pc->curcmd_flags & MEMTYPE_FILEADDR)
+					error(FATAL, "-f option cannot be used with percpu\n");
+				addr = htol(args[optind], FAULT_ON_ERROR, NULL);
+				aflag++;
+			} else {
 				if (pc->curcmd_flags & MEMTYPE_FILEADDR)
 					pc->curcmd_private = stoll(args[optind], 
 						FAULT_ON_ERROR, NULL);
@@ -4708,6 +6242,21 @@ cmd_datatype_common(ulong flags)
 				aflag++;
 			}
 		} else if ((sp = symbol_search(args[optind]))) {
+			if (cpuspec && !is_percpu_symbol(sp)) {
+				error(WARNING,
+				      "%s is not percpu; cpuspec ignored.\n",
+				      sp->name);
+				cpuspec = NULL;
+			}
+			if (cpuspec) {
+				if ((typename = expr_type_name(sp->name))) {
+				    	if (LASTCHAR(typename) == '*')
+						error(WARNING,
+						    "percpu symbol \"%s\" is of type pointer\n",
+							sp->name);
+					FREEBUF(typename);
+				}
+			}
 	                addr = sp->value;
 			aflag++;
 	        } else {
@@ -4719,6 +6268,14 @@ cmd_datatype_common(ulong flags)
 		}
 	}
 
+	if (cpuspec) {
+		cpus = get_cpumask_buf();
+		if (STREQ(cpuspec, ""))
+			SET_BIT(cpus, CURRENT_CONTEXT()->processor);
+		else
+			make_cpumask(cpuspec, cpus, FAULT_ON_ERROR, NULL);
+	}
+
 	optind = optind_save;
 
 	if (count == 0xdeadbeef)
@@ -4726,10 +6283,8 @@ cmd_datatype_common(ulong flags)
 	else if (!aflag)
 		error(FATAL, "no kernel virtual address argument entered\n");
 
-	if ((flags & SHOW_OFFSET) && aflag) {
-		error(INFO, "-o option not valid with an address argument\n");
-		flags &= ~SHOW_OFFSET;
-	}
+	if ((flags & DEREF_POINTERS) && !aflag)
+		error(FATAL, "-p option requires address argument\n");
 
 	if (list_head_offset)
 		addr -= list_head_offset;
@@ -4749,8 +6304,18 @@ cmd_datatype_common(ulong flags)
         } else
                 structname = args[optind];
 
-	if ((arg_to_datatype(structname, dm, DATATYPE_QUERY|RETURN_ON_ERROR) < 1))
+	if ((arg_to_datatype(structname, dm,
+		DATATYPE_QUERY|ANON_MEMBER_QUERY|RETURN_ON_ERROR) < 1))
 		error(FATAL, "invalid data structure reference: %s\n", structname);
+
+	if (! (flags & (STRUCT_REQUEST|UNION_REQUEST)) ) {
+		flags |= dm->type;
+		if (!(flags & (UNION_REQUEST|STRUCT_REQUEST)))
+			error(FATAL, "invalid argument");
+	} else if ( (flags &(STRUCT_REQUEST|UNION_REQUEST)) != dm->type) {
+		error(FATAL, "data type mismatch: %s is not a %s\n",
+		      dm->name, flags & UNION_REQUEST ? "union" : "struct");
+	}
 
         if ((argc_members > 1) && !aflag) {
                 error(INFO, flags & SHOW_OFFSET ? 
@@ -4761,7 +6326,64 @@ cmd_datatype_common(ulong flags)
 		flags |= SHOW_OFFSET;
 	}
 
-	len = dm->size;
+        if ((argc_members > 1) && aflag && (flags & SHOW_OFFSET))
+		error(FATAL, 
+		    "-o option not valid with multiple member format\n");
+
+	set_temporary_radix(radix, &restore_radix);
+
+	/*
+	 *  No address was passed -- dump the structure/member declaration.
+	 */
+	if (!aflag) {
+		if (argc_members &&
+		    !member_to_datatype(memberlist[0], dm,
+					ANON_MEMBER_QUERY))
+			error(FATAL, "invalid data structure reference: %s.%s\n",
+			      dm->name, memberlist[0]);
+		do_datatype_declaration(dm, flags | (dm->flags & TYPEDEF));
+	} else if (cpus) {
+		for (c = 0; c < kt->cpus; c++) {
+			ulong cpuaddr;
+
+			if (!NUM_IN_BITMAP(cpus, c))
+				continue;
+
+			cpuaddr = addr + kt->__per_cpu_offset[c];
+
+			fprintf(fp, "[%d]: ", c);
+
+			if (hide_offline_cpu(c)) {
+				fprintf(fp, "[OFFLINE]\n");
+				continue;
+			}
+
+			fprintf(fp, "%lx\n", cpuaddr);
+			do_datatype_addr(dm, cpuaddr , count,
+					 flags, memberlist, argc_members);
+		}
+	} else
+		do_datatype_addr(dm, addr, count, flags,
+				 memberlist, argc_members);
+
+	restore_current_radix(restore_radix);
+
+freebuf:
+        if (argc_members) {
+                FREEBUF(structname);
+                FREEBUF(members);
+	}
+
+	if (cpus)
+		FREEBUF(cpus);
+}
+
+static void
+do_datatype_addr(struct datatype_member *dm, ulong addr, int count,
+		 ulong flags, char **memberlist, int argc_members)
+{
+	int i, c;
+	long len = dm->size;
 
 	if (count < 0) {
 		addr -= len * abs(count);
@@ -4778,68 +6400,83 @@ cmd_datatype_common(ulong flags)
 		i = 0;
         	do {
                 	if (argc_members) {
-                        	*separator = '.';
-                        	strcpy(separator+1, memberlist[i]);
-			}
-
-			switch (arg_to_datatype(structname, dm, RETURN_ON_ERROR))
-			{
-			case 0: error(FATAL, "invalid data structure reference: %s\n", 
-					structname);
-				break;
-			case 1: break;
-			case 2: if (rawdata)
+				/* This call works fine with fields
+				 * of the second, third, ... levels.
+				 * There is no need to fix it
+				 */
+				if (!member_to_datatype(memberlist[i], dm,
+							ANON_MEMBER_QUERY))
+					error(FATAL, "invalid data structure reference: %s.%s\n",
+					      dm->name, memberlist[i]);
+				if (flags & SHOW_RAW_DATA)
         				error(FATAL, 
-					    "member-specific output not allowed with -r\n");
-				break;
+					      "member-specific output not allowed with -r\n");
 			}
-
-			if (!(dm->flags & TYPEDEF)) {
-				if (flags &(STRUCT_REQUEST|UNION_REQUEST) ) {
-					if ((flags & (STRUCT_REQUEST|UNION_REQUEST)) != dm->type) 
-						goto freebuf;
-				} else
-					flags |= dm->type;
-			}
-
-			/* 
-	 		 *  No address was passed -- dump the structure/member declaration.
-	 		 */
-			if (!aflag) {
-				do_datatype_declaration(dm, flags | (dm->flags & TYPEDEF));
-				goto freebuf;
-			}
-
-			if (!(flags & (UNION_REQUEST|STRUCT_REQUEST)))
-				error(FATAL, "invalid argument");
 
 			/*
-		 	 *  Display data.
+		 	 *  Display member addresses or data
 		 	 */
-                	if (rawdata)
-                        	raw_data_dump(addr, len, flags & STRUCT_VERBOSE);
-                	else {
+			if (flags & SHOW_OFFSET) {
+				dm->vaddr = addr;
+				do_datatype_declaration(dm, flags | (dm->flags & TYPEDEF));
+			} else if (flags & SHOW_RAW_DATA)
+				raw_data_dump(addr, len, flags & STRUCT_VERBOSE);
+			else if ((flags & DEREF_POINTERS) && !dm->member) {
+				print_struct_with_dereference(addr, dm, flags);
+                	} else {
 	                        if (dm->member)
 	                                open_tmpfile();
 	
-	        		if (flags & UNION_REQUEST)
-	                		print_union(dm->name, addr);
-	        		else if (flags & STRUCT_REQUEST)
-	                		print_struct(dm->name, addr);
-	
-	                        if (dm->member) {
-	                                parse_for_member(dm, PARSE_FOR_DATA);
-	                                close_tmpfile();
-	                        }
+				if (flags & UNION_REQUEST)
+					print_union(dm->name, addr);
+				else if (flags & STRUCT_REQUEST)
+					print_struct(dm->name, addr);
+
+				if (dm->member) {
+					if (!((flags & DEREF_POINTERS) &&
+				    	    dereference_pointer(addr, dm, flags))) {
+						if (count_chars(dm->member, '.') || count_chars(dm->member, '['))
+							parse_for_member_extended(dm, PARSE_FOR_DATA);
+						else
+							parse_for_member(dm, PARSE_FOR_DATA);
+					}
+					close_tmpfile();
+				}
+
                 	}
 		} while (++i < argc_members);
         }
+}
 
-freebuf:
-        if (argc_members) {
-                FREEBUF(structname);
-                FREEBUF(members);
-	}
+int
+is_string(char *structure, char *member)
+{
+	int retval;
+        char *t;
+        char buf[BUFSIZE];
+
+	retval = FALSE;
+        open_tmpfile();
+        whatis_datatype(structure, STRUCT_REQUEST, pc->tmpfile);
+        rewind(pc->tmpfile);
+        while (fgets(buf, BUFSIZE, pc->tmpfile)) {
+                if (!(t = strstr(buf, "char ")))
+                        continue;
+                t += 5;
+                if (*t == '*')
+                    t++;
+                if (t != strstr(t, member))
+                    continue;
+                t += strlen(member);
+                if (*t == ';' || *t == '[') {
+                        retval = TRUE;
+                        break;
+                }
+        }
+
+        close_tmpfile();
+
+        return retval;
 }
 
 
@@ -4858,8 +6495,12 @@ do_datatype_declaration(struct datatype_member *dm, ulong flags)
 	if (CRASHDEBUG(1))
 		dump_datatype_member(fp, dm);
 
+	if (dm->member && count_chars(dm->member, '.'))
+		error(FATAL, "invalid data structure reference: %s.%s\n",
+			dm->name, dm->member);
+
         open_tmpfile();
-        whatis_datatype(dm->name, flags);
+        whatis_datatype(dm->name, flags, pc->tmpfile);
         rewind(pc->tmpfile);
 
 	if (dm->member)
@@ -4897,7 +6538,7 @@ do_datatype_declaration(struct datatype_member *dm, ulong flags)
 				if ((flags & SHOW_OFFSET) && whitespace(buf[0]))
 					show_member_offset(sfp, dm, buf);
 				else
-                                        fprintf(sfp, buf);
+                                        fprintf(sfp, "%s", buf);
 			}
 		}
         }
@@ -4963,12 +6604,8 @@ arg_to_datatype(char *s, struct datatype_member *dm, ulong flags)
 	if (!both) 
 		return 1;
 
-	dm->member = p1+1;
-
-    	if ((dm->member_offset = MEMBER_OFFSET(dm->name, dm->member)) < 0) 
-		goto datatype_member_fatal;
-
-	return 2;
+	if (member_to_datatype(p1 + 1, dm, flags))
+		return 2;
 
 datatype_member_fatal:
 
@@ -4990,6 +6627,21 @@ datatype_member_fatal:
        	return (error(FATAL, "invalid argument: %s\n", s));
 }
 
+static int
+member_to_datatype(char *s, struct datatype_member *dm, ulong flags)
+{
+	dm->member = s;
+
+	if ((dm->member_offset = MEMBER_OFFSET(dm->name, s)) >= 0)
+		return TRUE;
+
+	if ((flags & ANON_MEMBER_QUERY) &&
+	    ((dm->member_offset = ANON_MEMBER_OFFSET(dm->name, s)) >= 0))
+		return TRUE;
+
+	return FALSE;
+}
+
 /*
  *  debug routine -- not called on purpose by anybody.
  */
@@ -4999,9 +6651,9 @@ dump_datatype_member(FILE *ofp, struct datatype_member *dm)
 	int others;
 
 	others = 0;
-        fprintf(ofp, "         name: %s\n", dm->name);
-        fprintf(ofp, "       member: %s\n", dm->member);
-        fprintf(ofp, "         type: %lx (", dm->type);
+        fprintf(ofp, "           name: %s\n", dm->name);
+        fprintf(ofp, "         member: %s\n", dm->member);
+        fprintf(ofp, "           type: %lx (", dm->type);
 	if (dm->type & STRUCT_REQUEST)
 		fprintf(ofp, "%sSTRUCT_REQUEST", others++ ? "|" : "");
         if (dm->type & UNION_REQUEST)
@@ -5027,12 +6679,117 @@ dump_datatype_member(FILE *ofp, struct datatype_member *dm)
         if (dm->type & IN_STRUCT)
 		fprintf(ofp, "%sIN_STRUCT", others++ ? "|" : "");
 	fprintf(ofp, ")\n");
-        fprintf(ofp, "         size: %ld\n", dm->size);
-        fprintf(ofp, "member_offset: %ld\n", dm->member_offset);
-        fprintf(ofp, "  member_size: %ld\n", dm->member_size);
-        fprintf(ofp, "        flags: %lx ", dm->flags);
+        fprintf(ofp, "           size: %ld\n", dm->size);
+        fprintf(ofp, "  member_offset: %ld\n", dm->member_offset);
+        fprintf(ofp, "    member_size: %ld\n", dm->member_size);
+	fprintf(ofp, "member_typecode: %d\n", dm->member_typecode);
+        fprintf(ofp, "          flags: %lx ", dm->flags);
 	dump_datatype_flags(dm->flags, ofp);
+	fprintf(ofp, "        tagname: %s\n", dm->tagname);
+	fprintf(ofp, "          value: %ld\n", dm->value);
+	fprintf(ofp, "          vaddr: %lx\n", dm->vaddr);
 	fprintf(ofp, "\n");
+}
+
+struct type_request {
+	int cnt;	    /* current number of entries in types array */
+	int idx;	    /* index to next entry in types array */
+	struct type_info {  /* dynamically-sized array of collected types */
+		char *name;
+		ulong size;
+	} *types;
+};
+
+static int
+compare_size_name(const void *va, const void *vb) {
+	struct type_info *a, *b;
+
+	a = (struct type_info *)va;
+	b = (struct type_info *)vb;
+
+        if (a->size == b->size)
+                return strcmp(a->name, b->name);
+        else
+                return a->size < b->size ? -1 : 1;
+}
+
+static void
+append_struct_symbol (struct type_request *treq,  struct gnu_request *req)
+{
+	int i; 
+	long s;
+
+	for (i = 0; i < treq->idx; i++)
+		if (treq->types[i].name == req->name)
+			break;
+
+	if (i < treq->idx) // We've already collected this type
+		return;
+
+	if (treq->idx == treq->cnt) {
+		s = sizeof(struct type_info) * treq->cnt;
+		RESIZEBUF(treq->types, s, s * 3);
+		treq->cnt *= 3;
+	}
+
+	treq->types[treq->idx].name = req->name;
+	treq->types[treq->idx].size = req->length;
+	treq->idx++;
+}
+
+static void
+request_types(ulong lowest, ulong highest, char *member_name)
+{
+	int i, len;
+	char buf[BUFSIZE];
+	struct type_request typereq;
+	struct gnu_request request = {0};
+
+	typereq.idx = 0;
+	typereq.cnt = 16;
+	typereq.types = (void *)GETBUF(16 * sizeof(struct type_info));
+
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1) || defined(GDB_7_0)
+	error(FATAL, "-r option not supported with this version of gdb\n");
+#else
+	request.type_name = member_name;
+#endif
+
+	while (!request.global_iterator.finished) {
+		request.command = GNU_GET_NEXT_DATATYPE;
+		gdb_interface(&request);
+		if (highest && 
+		    !(lowest <= request.length && request.length <= highest))
+			continue;
+
+		if (member_name) {
+			request.command = GNU_LOOKUP_STRUCT_CONTENTS;
+			gdb_interface(&request);
+			if (!request.value)
+				continue;
+		}
+
+		append_struct_symbol(&typereq, &request);		
+	}
+
+	qsort(typereq.types, typereq.idx, sizeof(struct type_info), compare_size_name);
+
+	if (typereq.idx == 0)
+		fprintf(fp, "(none found)\n");
+	else {
+		sprintf(buf, "%ld", typereq.types[typereq.idx-1].size);
+		len = MAX(strlen(buf), strlen("SIZE"));
+		fprintf(fp, "%s  TYPE\n",
+			mkstring(buf, len, RJUST, "SIZE"));
+
+		for (i = 0; i < typereq.idx; i++)
+			fprintf(fp, "%s  %s\n", 
+				mkstring(buf, len, RJUST|LONG_DEC, 
+				MKSTR(typereq.types[i].size)),
+				typereq.types[i].name);
+	}
+
+	FREEBUF(typereq.types);
 }
 
 /*
@@ -5049,25 +6806,47 @@ dump_datatype_member(FILE *ofp, struct datatype_member *dm)
  *     declaration is displayed.
  *  5. For a kernel symbol name, the output is the same as if the "sym" command
  *     was used.
+ *  6. If the -r and -m are given, then the structures/unions of specified size
+ *     and/or contain a member type.
  */
 void
 cmd_whatis(void)
 {
+	int c, do_request;
         struct datatype_member datatype_member, *dm;
 	struct syment *sp;
-        char buf[BUFSIZE];
+	char buf[BUFSIZE], *pl, *ph, *member;
 	long len;
-	int c;
+	ulong lowest, highest;
         ulong flags;
 
         dm = &datatype_member;
 	flags = 0;
+	lowest = highest = 0;
+	pl = buf;
+	member = NULL;
+	do_request = FALSE;
 
-        while ((c = getopt(argcnt, args, "o")) != EOF) {
+        while ((c = getopt(argcnt, args, "om:r:")) != EOF) {
                 switch(c)
                 {
 		case 'o':
 			flags |= SHOW_OFFSET;
+			break;
+
+		case 'm':
+			member = optarg;
+			do_request = TRUE;
+			break;
+
+		case 'r':
+			strncpy(buf, optarg, 15);
+			if ((ph = strstr(buf, "-")) != NULL)
+				*(ph++) = '\0';
+			highest = lowest = stol(pl, FAULT_ON_ERROR, NULL);
+			if (ph)
+				highest = stol(ph, FAULT_ON_ERROR, NULL);
+			do_request = TRUE;
 			break;
 
                 default:
@@ -5075,6 +6854,11 @@ cmd_whatis(void)
                         break;
                 }
         }
+
+	if (!argerrs && do_request) {
+		request_types(lowest, highest, member);
+		return;
+	}
 
         if (argerrs || !args[optind])
                 cmd_usage(pc->curcmd, SYNOPSIS);
@@ -5144,7 +6928,7 @@ gdb_whatis(char *s)
 		p1 = buf;
 		if (STRNEQ(buf, "type = "))
 			p1 += strlen("type = ");
-		fprintf(pc->saved_fp, p1);
+		fprintf(pc->saved_fp, "%s", p1);
         }
 
 	close_tmpfile();
@@ -5153,12 +6937,18 @@ gdb_whatis(char *s)
 }
 
 /*
- *  Given the name of an enum, have gdb dump its enumertor list.
+ *  Given the name of an enum, have gdb dump its enumerator list.
  */
-static void
+int
 dump_enumerator_list(char *e)
 {
         struct gnu_request *req;
+        struct datatype_member datatype_member, *dm;
+        dm = &datatype_member;
+
+        if (!arg_to_datatype(e, dm, RETURN_ON_ERROR) ||
+	    (dm->size < 0) || (dm->type != ENUM) || dm->tagname)
+		return FALSE;
 
         req = (struct gnu_request *)GETBUF(sizeof(struct gnu_request));
         req->command = GNU_GET_DATATYPE;
@@ -5168,6 +6958,8 @@ dump_enumerator_list(char *e)
         gdb_interface(req);
 
 	FREEBUF(req);
+
+	return TRUE;
 }
 
 /*
@@ -5229,28 +7021,29 @@ cmd_p(void)
 {
         int c;
 	struct syment *sp, *percpu_sp;
-	unsigned restore_radix;
-	int leader, do_load_module_filter, success;
+	unsigned radix;
+	int do_load_module_filter;
 	char buf1[BUFSIZE]; 
-	char buf2[BUFSIZE]; 
-	char *p1;
+	char *cpuspec;
 
-	leader = do_load_module_filter = restore_radix = 0;
+	do_load_module_filter = radix = 0;
 
         while ((c = getopt(argcnt, args, "dhxu")) != EOF) {
                 switch(c)
                 {
 		case 'd':
-			restore_radix = *gdb_output_radix;
-			*gdb_output_radix = 10;
-                	*gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
+			if (radix == 16)
+				error(FATAL, 
+				    "-d and -x are mutually exclusive\n");
+			radix = 10;
 			break;
 
 		case 'h':
 		case 'x':
-                        restore_radix = *gdb_output_radix;
-                        *gdb_output_radix = 16;
-                        *gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
+			if (radix == 10)
+				error(FATAL, 
+				    "-d and -x are mutually exclusive\n");
+			radix = 16;
                         break;
 
 		case 'u':
@@ -5266,28 +7059,57 @@ cmd_p(void)
         if (argerrs || !args[optind])
                 cmd_usage(pc->curcmd, SYNOPSIS);
 
+	cpuspec = strrchr(args[optind], ':');
+	if (cpuspec)
+		*cpuspec++ = NULLCHAR;
+
+	sp = NULL;
 	if ((sp = symbol_search(args[optind])) && !args[optind+1]) {
 		if ((percpu_sp = per_cpu_symbol_search(args[optind])) &&
-		    display_per_cpu_info(percpu_sp))
+		    display_per_cpu_info(percpu_sp, radix, cpuspec))
 			return;
-		sprintf(buf2, "%s = ", args[optind]);
-		leader = strlen(buf2);
 		if (module_symbol(sp->value, NULL, NULL, NULL, *gdb_output_radix))
 			do_load_module_filter = TRUE;
-	} else if (st->flags & LOAD_MODULE_SYMS)
+	} else if ((percpu_sp = per_cpu_symbol_search(args[optind])) &&
+		   display_per_cpu_info(percpu_sp, radix, cpuspec))
+		return;
+	else if (st->flags & LOAD_MODULE_SYMS)
 		do_load_module_filter = TRUE;
+
+	if (cpuspec) {
+		if (sp)
+			error(WARNING, "%s is not percpu; cpuspec ignored.\n",
+			      sp->name);
+		else
+			/* maybe a valid C expression (e.g. ':') */
+			*(cpuspec-1) = ':';
+	}
+
+	process_gdb_output(concat_args(buf1, 0, TRUE), radix,
+			   sp ? sp->name : NULL, do_load_module_filter);
+}
+
+static void
+process_gdb_output(char *gdb_request, unsigned radix,
+		   const char *leader, int do_load_module_filter)
+{
+	unsigned restore_radix;
+	int success;
+	char buf1[BUFSIZE]; 
+	char *p1;
 
 	if (leader || do_load_module_filter)
 		open_tmpfile();
 
-       	success = gdb_pass_through(concat_args(buf1, 0, TRUE), NULL, 
-		GNU_RETURN_ON_ERROR);
+	set_temporary_radix(radix, &restore_radix);
+
+       	success = gdb_pass_through(gdb_request, NULL, GNU_RETURN_ON_ERROR);
 
 	if (success && (leader || do_load_module_filter)) {
 		int firstline;
 
 		if (leader) {
-			fprintf(pc->saved_fp, buf2); 
+			fprintf(pc->saved_fp, "%s = ", leader);
 			fflush(pc->saved_fp);
 		}
 
@@ -5298,10 +7120,11 @@ cmd_p(void)
 			    (p1 = strstr(buf1, "{")) &&
 			    !STRNEQ(p1, "{\n")) { 
 				*p1 = NULLCHAR;
-				fprintf(pc->saved_fp, buf1);
-				fprintf(pc->saved_fp, "\n {%s", p1+1);
-			} else 
-				fprintf(pc->saved_fp, do_load_module_filter ?
+				fprintf(pc->saved_fp, "%s", buf1);
+				fprintf(pc->saved_fp, "\n {");
+				print_verbatim(pc->saved_fp, p1+1);
+			} else
+				print_verbatim(pc->saved_fp, do_load_module_filter ?
 				    load_module_filter(buf1, LM_P_FILTER) : 
 				    buf1);
 
@@ -5312,14 +7135,44 @@ cmd_p(void)
 	if (leader || do_load_module_filter)
 		close_tmpfile();
 
-	if (restore_radix) {
-                *gdb_output_radix = restore_radix;
-                *gdb_output_format = (*gdb_output_radix == 10) ? 0 : 'x';
-	}
+	restore_current_radix(restore_radix);
 
 	if (!success) 
-		error(FATAL, "gdb request failed: %s\n",
-			concat_args(buf1, 0, TRUE));
+		error(FATAL, "gdb request failed: %s\n", gdb_request);
+}
+
+/*
+ *  Get the type of an expression using gdb's "whatis" command.
+ *  The returned string is dynamically allocated, and it should
+ *  be passed to FREEBUF() when no longer needed.
+ *  Return NULL if the type cannot be determined.
+ */
+static char *
+expr_type_name(const char *expr)
+{
+	char buf[BUFSIZE], *p;
+
+	open_tmpfile();
+	sprintf(buf, "whatis %s", expr);
+	if (!gdb_pass_through(buf, fp, GNU_RETURN_ON_ERROR)) {
+		close_tmpfile();
+		return NULL;
+	}
+
+	rewind(pc->tmpfile);
+	while (fgets(buf, BUFSIZE, pc->tmpfile) && !STRNEQ(buf, "type = "))
+		;
+	p = feof(pc->tmpfile) ? NULL : buf + strlen("type = ");
+	close_tmpfile();
+
+	if (p) {
+		size_t len = strlen(clean_line(p));
+		/* GDB reports unknown types as <...descriptive text...> */
+		if (p[0] == '<' && p[len-1] == '>')
+			return NULL;
+		return strcpy(GETBUF(len + 1), p);
+	}
+	return NULL;
 }
 
 /*
@@ -5327,32 +7180,116 @@ cmd_p(void)
  *  the addresses of each its per-cpu instances.
  */
 static int
-display_per_cpu_info(struct syment *sp)
+display_per_cpu_info(struct syment *sp, int radix, char *cpuspec)
 {
+	ulong *cpus;
 	int c;
 	ulong addr;
 	char buf[BUFSIZE];
+	char leader[sizeof("&per_cpu(") + strlen(sp->name) +
+		    sizeof(", " STR(UINT_MAX) ")")];
+	char *typename;
+	int do_load_module_filter;
 
 	if (((kt->flags & (SMP|PER_CPU_OFF)) != (SMP|PER_CPU_OFF)) ||
-	    (sp->value < symbol_value("__per_cpu_start")) || 
-	    (sp->value >= symbol_value("__per_cpu_end")) ||
+	    (!is_percpu_symbol(sp)) ||
 	    !((sp->type == 'd') || (sp->type == 'D') || (sp->type == 'V')))
 		return FALSE;
 
-	fprintf(fp, "PER-CPU DATA TYPE:\n  ");
-        sprintf(buf, "whatis %s", sp->name);
-        if (!gdb_pass_through(buf, pc->nullfp, GNU_RETURN_ON_ERROR))
-                fprintf(fp, "[undetermined type] %s;\n", sp->name);
-	else
-        	whatis_variable(sp);
+	if (cpuspec) {
+		cpus = get_cpumask_buf();
+		if (STREQ(cpuspec, ""))
+			SET_BIT(cpus, CURRENT_CONTEXT()->processor);
+		else
+			make_cpumask(cpuspec, cpus, FAULT_ON_ERROR, NULL);
+	} else
+		cpus = NULL;
 
-	fprintf(fp, "PER-CPU ADDRESSES:\n");
-	for (c = 0; c < kt->cpus; c++) {
-		addr = sp->value + kt->__per_cpu_offset[c];
-		fprintf(fp, "  [%d]: %lx\n", c, addr);
+	typename = expr_type_name(sp->name);
+
+	if (!cpus) {
+		fprintf(fp, "PER-CPU DATA TYPE:\n  ");
+		if (!typename)
+			fprintf(fp, "[undetermined type] %s;\n", sp->name);
+		else
+			whatis_variable(sp);
+
+		fprintf(fp, "PER-CPU ADDRESSES:\n");
 	}
 
+	do_load_module_filter =
+		module_symbol(sp->value, NULL, NULL, NULL, *gdb_output_radix);
+
+	for (c = 0; c < kt->cpus; c++) {
+		if (hide_offline_cpu(c)) {
+			fprintf(fp, "cpu %d is OFFLINE\n", c);
+			continue;
+		}
+
+		if (cpus && !NUM_IN_BITMAP(cpus, c))
+			continue;
+		addr = sp->value + kt->__per_cpu_offset[c];
+		if (!cpus)
+			fprintf(fp, "  [%d]: %lx\n", c, addr);
+		else if (typename) {
+			snprintf(buf, sizeof buf, "p *(%s*) 0x%lx",
+				 typename, addr);
+			sprintf(leader, "per_cpu(%s, %u)",
+				sp->name, c);
+			process_gdb_output(buf, radix, leader,
+					   do_load_module_filter);
+		} else {
+			snprintf(buf, sizeof buf, "p (void*) 0x%lx", addr);
+			sprintf(leader, "&per_cpu(%s, %u)",
+				sp->name, c);
+			process_gdb_output(buf, radix, leader,
+					   do_load_module_filter);
+		}
+	}
+
+	if (typename)
+		FREEBUF(typename);
+	if (cpus)
+		FREEBUF(cpus);
+
 	return TRUE;
+}
+
+static struct load_module *
+get_module_percpu_sym_owner(struct syment *sp)
+{
+	int i;
+	struct load_module *lm;
+
+	if (!IS_MODULE_SYMBOL(sp))
+		return NULL;
+
+	/*
+	 * Find out percpu symbol owner module.
+	 * If found out, sp is module's percpu symbol.
+	 */
+	for (i = 0; i < st->mods_installed; i++) {
+		lm = &st->load_modules[i];
+		if (!MODULE_PERCPU_SYMS_LOADED(lm))
+			continue;
+		if (IN_MODULE_PERCPU(sp->value, lm))
+			return lm;
+	}
+	return NULL;
+}
+
+static int 
+is_percpu_symbol(struct syment *sp)
+{
+	if (sp->value >= st->__per_cpu_start) {
+		if (sp->value < st->__per_cpu_end)
+			/* kernel percpu symbol */
+			return 1;
+		else if (get_module_percpu_sym_owner(sp))
+			/* module percpu symbol */
+			return 2;
+	}
+	return 0;
 }
 
 /*
@@ -5487,6 +7424,9 @@ print_struct(char *s, ulong addr)
 {
 	char buf[BUFSIZE];
 
+	if (is_downsized(s))
+		pc->curcmd_flags |= PARTIAL_READ_OK;
+
 	if (is_typedef(s))
         	sprintf(buf, "output *(%s *)0x%lx", s, addr);
 	else
@@ -5494,6 +7434,8 @@ print_struct(char *s, ulong addr)
 	fprintf(fp, "struct %s ", s);
 	gdb_pass_through(buf, NULL, GNU_RETURN_ON_ERROR);
 	fprintf(fp, "\n");
+
+	pc->curcmd_flags &= ~PARTIAL_READ_OK;
 }
 
 
@@ -5505,12 +7447,17 @@ print_union(char *s, ulong addr)
 {
 	char buf[BUFSIZE];
 
+	if (is_downsized(s))
+		pc->curcmd_flags |= PARTIAL_READ_OK;
+
         if (is_typedef(s))
                 sprintf(buf, "output *(%s *)0x%lx", s, addr);
         else 
         	sprintf(buf, "output *(union %s *)0x%lx", s, addr);
         fprintf(fp, "union %s ", s);
         gdb_pass_through(buf, NULL, GNU_RETURN_ON_ERROR);
+
+	pc->curcmd_flags &= ~PARTIAL_READ_OK;
 }
 
 /*
@@ -5519,7 +7466,7 @@ print_union(char *s, ulong addr)
  *  file is shown; otherwise the bitpos, size and id data is stripped.
  */
 static void 
-whatis_datatype(char *st, ulong flags)
+whatis_datatype(char *st, ulong flags, FILE *ofp)
 {
 	char lookbuf[BUFSIZE];
 
@@ -5532,7 +7479,7 @@ whatis_datatype(char *st, ulong flags)
         else
                 return;
 
-	if (!gdb_pass_through(lookbuf, fp, GNU_RETURN_ON_ERROR)) {
+	if (!gdb_pass_through(lookbuf, ofp, GNU_RETURN_ON_ERROR)) {
 		/*
 		 *  When a structure is defined using the format:
                  *
@@ -5547,7 +7494,7 @@ whatis_datatype(char *st, ulong flags)
                  */
 		if (flags & (UNION_REQUEST|STRUCT_REQUEST)) {
                 	sprintf(lookbuf, "ptype %s", st);
-			gdb_pass_through(lookbuf, fp, 0);
+			gdb_pass_through(lookbuf, ofp, 0);
 		}
 	}
 }
@@ -5603,7 +7550,7 @@ whatis_variable(struct syment *sp)
 /*
  *  Determines whether the current structure or union member is a typedef.
  */
-static int 
+int 
 is_typedef(char *name)
 {
 	struct datatype_member datatype_member, *dm;
@@ -5657,6 +7604,12 @@ dump_datatype_flags(ulong flags, FILE *ofp)
 		fprintf(ofp, "%sSHOW_OFFSET", others++ ? "|" : "");
 	if (flags & DATATYPE_QUERY)
 		fprintf(ofp, "%sDATATYPE_QUERY", others++ ? "|" : "");
+	if (flags & ANON_MEMBER_QUERY)
+		fprintf(ofp, "%sANON_MEMBER_QUERY", others++ ? "|" : "");
+	if (flags & SHOW_RAW_DATA)
+		fprintf(ofp, "%sSHOW_RAW_DATA", others++ ? "|" : "");
+	if (flags & DEREF_POINTERS)
+		fprintf(ofp, "%sDEREF_POINTERS", others++ ? "|" : "");
 	fprintf(ofp, ")\n");
 }
 
@@ -5676,12 +7629,14 @@ parse_for_member(struct datatype_member *dm, ulong flag)
 	char lookfor4[BUFSIZE];
 	char lookfor5[BUFSIZE];
 	long curpos, last_open_bracket;
-	int indent, on, array;
+	int indent, on, array, embed;
+	char *p1;
 
 	s = dm->member;
 	indent = 0;
 	array = FALSE;
 	on = 0;
+	embed = 0;
 	rewind(pc->tmpfile);
 
 	switch (flag)  
@@ -5691,7 +7646,16 @@ parse_for_member(struct datatype_member *dm, ulong flag)
 		sprintf(lookfor2, "  %s[", s);
 next_item:
 		while (fgets(buf, BUFSIZE, pc->tmpfile)) {
-			if (STRNEQ(buf, lookfor1) || STRNEQ(buf, lookfor2)) {
+			if (embed && (count_leading_spaces(buf) == embed))
+				embed = 0;
+
+			if (!on && !embed && strstr(buf, "= {") && !strstr(buf, lookfor1))
+				embed = count_leading_spaces(buf);
+
+			if (embed)
+				continue;
+
+			if (strstr(buf, lookfor1) || strstr(buf, lookfor2)) {
 				on++;
 				if (strstr(buf, "= {")) 
 					indent = count_leading_spaces(buf);
@@ -5704,12 +7668,20 @@ next_item:
 				    !strstr(buf, "}")) || (buf[0] == '}')) {
 					break;
 				}
-				fprintf(pc->saved_fp, buf);
-				if (!indent)
+				if (!indent) {
+					if ((p1 = strstr(buf, ", \n")))
+						sprintf(p1, "\n");
+					fprintf(pc->saved_fp, "%s", buf);
 					break;
+				}
 				if (strstr(buf, "}") && 
-				    (count_leading_spaces(buf) == indent))
+				    (count_leading_spaces(buf) == indent)) {
+					if ((p1 = strstr(buf, "}, \n")))
+						sprintf(p1, "}\n");
+					fprintf(pc->saved_fp, "%s", buf);
 					break;
+				}
+				fprintf(pc->saved_fp, "%s", buf);
 				on++;
 			}
 		}
@@ -5773,6 +7745,286 @@ next_item:
 	}
 }
 
+struct struct_elem {
+	char field_name[BUFSIZE];
+	unsigned char field_len;
+	char value[BUFSIZE];
+	unsigned char is_array_root:1;
+
+	struct struct_elem *parent;
+	struct struct_elem *inner;
+	struct struct_elem *next;
+	struct struct_elem *prev;
+};
+
+#define ALLOC_XXX_ELEMENT(xxx, clone_parent) \
+{ \
+	if (current == NULL) { \
+		error(FATAL, "Internal error while parsing structure %s\n", dm->name); \
+	} \
+	current->xxx = (struct struct_elem *)GETBUF(sizeof(struct struct_elem)); \
+	if (clone_parent) current->xxx->parent = current->parent; \
+		else current->xxx->parent = current; \
+	current = current->xxx; \
+}
+
+#define ALLOC_INNER_ELEMENT { ALLOC_XXX_ELEMENT(inner, 0) }
+#define ALLOC_NEXT_ELEMENT { ALLOC_XXX_ELEMENT(next, 1) }
+
+static void
+free_structure(struct struct_elem *p)
+{
+	if (p == NULL)
+		return;
+	free_structure(p->inner);
+	free_structure(p->next);
+	FREEBUF(p);
+}
+
+static unsigned char
+is_right_brace(const char *b)
+{
+	unsigned char r = 0;
+	for (; *b == ' '; b++);
+	if (*b == '}') {
+		b++;
+		r = 1;
+		if (*b == '}') {
+			r = 2;
+			b++;
+		}
+	}
+
+	if (*b == ',')
+		b++;
+
+	if (*b == '\0')
+		return r;
+	else
+		return 0;
+}
+
+static struct struct_elem *
+find_node(struct struct_elem *s, char *n)
+{
+	char *p, *b, *e;
+	struct struct_elem *t = s;
+	unsigned i;
+
+	if (('\0' == *n) || (s == NULL))
+		return s;
+
+	/* [n .. p) - struct member with index*/
+	if ((p = strstr(n, ".")) == NULL)
+		p = n + strlen(n);
+
+	/* [n .. b) - struct member without index*/
+	for (b = n; (b < p) && (*b != '['); b++);
+
+	/* s - is the current level of items [s, s->next, ..., s->...->next] */
+	for (; s; s = s->next) {
+		if (*s->field_name == '\0')
+			continue;
+
+		/* `field_name` doesn't match */
+		if (((b - n) != s->field_len) || memcmp(s->field_name, n, b - n))
+			continue;
+
+		// For case like `pids.node` where pids is an array
+		if (s->is_array_root && *b != '[' && *p)
+			return NULL;
+
+		if (*b == '[') { /* Array */
+			i = strtol(b + 1, &e, 10);
+			/* Check if the current node is array and
+			 * we've parsed index more or less correctly
+			 */
+			if (!(s->is_array_root && *e == ']' && (e != b + 1)))
+				return NULL;
+
+			/* Look for the i-th element */
+			for (s = s->inner; s && i; s = s->next, i--);
+			if (i || (s == NULL))
+				return NULL;
+		}
+
+		/* Ok. We've found node, it's - the last member
+		 * in our search string, let's return it.
+		 */
+		if ('\0' == *p)
+			return s;
+		else
+			return find_node(s->inner, p + 1);
+	}
+
+	// We haven't found any field.
+	// Might happen, we've encountered anonymous structure
+	// of union. Lets try every record without `field_name`
+	s = t;
+	t = NULL;
+	for (; s; s = s->next) {
+		if (*s->field_name)
+			continue;
+		t = find_node(s->inner, n);
+		if (t)
+			break;
+	}
+
+	return t;
+}
+
+static void
+dump_node(struct struct_elem *p, char *f, unsigned char level, unsigned char is_array)
+{
+	unsigned int i;
+	if (p == NULL)
+		return;
+	do {
+#define PUT_INDENTED_STRING(m, ...) { \
+	for (i = 0; i++ < 2 + 2 * (m * is_array + level); fprintf(pc->saved_fp, " ")); \
+	fprintf(pc->saved_fp, __VA_ARGS__); }
+
+		if (p->inner) {
+			if (*p->field_name) {
+				PUT_INDENTED_STRING(1, "%s = %s\n", f ? f : p->field_name, 
+					p->inner->is_array_root ? "{{" : "{");
+			} else {
+				if (f) /* For union */
+					PUT_INDENTED_STRING(1, "%s = ", f);
+				PUT_INDENTED_STRING(1, "%s\n", p->inner->is_array_root ? "{{" : "{");
+			}
+			dump_node(p->inner, NULL, is_array + level + 1, p->inner->is_array_root);
+			PUT_INDENTED_STRING(1, "%s%s\n", p->inner->is_array_root ? "}}" : "}", 
+				(p->next && !p->next->is_array_root) ? "," : "");
+		} else {
+			PUT_INDENTED_STRING(1, "%s = %s%s", f ? f : p->field_name, 
+				p->value, p->next ? ",\n" : "\n");
+		}
+		if (level) {
+			p = p->next;
+			if (p && p->is_array_root)
+				PUT_INDENTED_STRING(0, "}, {\n");
+		}
+	} while (p && level);
+}
+
+void
+parse_for_member_extended(struct datatype_member *dm,
+	ulong __attribute__ ((unused)) flag)
+{
+	struct struct_elem *i, *current = NULL, *root = NULL;
+
+	char buf[BUFSIZE];
+	char *p, *p1;
+	char *s_e; // structure_element
+	unsigned int len;
+	unsigned char trailing_comma, braces, found = 0;
+
+	rewind(pc->tmpfile);
+
+	root = (struct struct_elem *)GETBUF(sizeof(struct struct_elem));
+	current = root;
+	ALLOC_INNER_ELEMENT;
+
+	while (fgets(buf, BUFSIZE, pc->tmpfile)) {
+		len = strlen(buf) - 1;
+		for (; buf[len] <= ' '; buf[len--] = '\0');
+		if ((trailing_comma = (buf[len] == ',')))
+			buf[len--] = '\0';
+
+		if ((braces = is_right_brace(buf))) {
+			for (; braces && current; braces--)
+				current = current->parent;
+
+			if ((current->parent == root) || trailing_comma)
+				ALLOC_NEXT_ELEMENT;
+			continue;
+		}
+
+		for (p1 = buf; *p1 == ' '; p1++);
+
+		if ((p = strstr(buf, " = ")) != NULL)
+			s_e = p + 3;
+		else
+			s_e = p1;
+
+		/*
+		 * After that we have pointers:
+		 *      foobar = bazzz
+		 * -----^     ^  ^
+		 * |    ------|  |
+		 * |    |        |
+		 * p1   p        s_e
+		 *
+		 * OR
+		 *
+		 *      {
+		 *      ^
+		 *      |
+		 *  ---------
+		 *  |       |
+		 *  p1      s_e
+		 *      
+		 *      p == NULL
+		 *
+		 *
+		 * p1   - the first non-whitespace symbol in line
+		 * p    - pointer to line ' = '. 
+		 *        If not NULL, there is identifier
+		 * s_e  - element of structure (brace / double brace / array separator / scalar)
+		 *
+		 */
+
+		if (current && p && (p - p1 < BUFSIZE)) {
+			strncpy(current->field_name, p1, p - p1);
+			current->field_len = p - p1;
+		}
+
+		if ( p && (*s_e != '{' || (*s_e == '{' && buf[len] == '}') )) {
+			/* Scalar or one-line array
+			 * next = 0x0 
+			 *   or 
+			 * files = {0x0, 0x0}
+			 */
+			strcpy(current->value, s_e);
+			if (trailing_comma) ALLOC_NEXT_ELEMENT;
+		}
+		else if ( *s_e == '{' ) {
+			ALLOC_INNER_ELEMENT;
+			if (*(s_e + 1) == '{') {
+				current->parent->is_array_root = 1;
+				ALLOC_INNER_ELEMENT;
+			}
+		}
+		else if (strstr(s_e, "}, {")) {
+			/* Next array element */
+			current = current->parent;
+			ALLOC_NEXT_ELEMENT;
+			ALLOC_INNER_ELEMENT;
+		}
+		else if (buf == (p = strstr(buf, "struct "))) {
+			p += 7; /* strlen "struct " */
+			p1 = strstr(buf, " {");
+			strncpy(current->field_name, p, p1 - p);
+			ALLOC_INNER_ELEMENT;
+		}
+	}
+
+	for (i = root->inner; i; i = i->next) {
+		if ((current = find_node(i->inner, dm->member))) {
+			dump_node(current, dm->member, 0, 0);
+			found = 1;
+			break;
+		}
+	}
+
+	free_structure(root);
+
+	if (!found)
+		error(INFO, "invalid data structure member reference: %s\n",
+			dm->member);
+}
+
 /*
  *  Dig out a member name from a formatted gdb structure declaration dump,
  *  and print its offset from the named structure passed in.
@@ -5794,11 +8046,6 @@ show_member_offset(FILE *ofp, struct datatype_member *dm, char *inbuf)
 		return FALSE;
 	}
 
-
-	if (STRNEQ(inbuf, "        ")) {
-		end_of_block = FALSE;
-		goto do_empty_offset;
-	}
 	if (STRNEQ(inbuf, "    union {")) 
 		dm->flags |= IN_UNION;
 	if (STRNEQ(inbuf, "    struct {")) 
@@ -5861,11 +8108,17 @@ show_member_offset(FILE *ofp, struct datatype_member *dm, char *inbuf)
 	offset = MEMBER_OFFSET(dm->name, target);
 
 	if (offset == -1) 
+		offset = ANON_MEMBER_OFFSET(dm->name, target);
+
+	if (offset == -1)
 		goto do_empty_offset;
 
 	if (end_of_block && dm->member) {
-        	sprintf(buf1, *gdb_output_radix == 10 ?  
-			"  [%ld]" : "  [0x%lx]", offset);
+		if (dm->vaddr)
+			sprintf(buf1, "  [%lx]", offset + dm->vaddr);
+		else
+			sprintf(buf1, *gdb_output_radix == 10 ?  
+				"  [%ld]" : "  [0x%lx]", offset);
         	sprintf(fmt, "%c%ds", '%', len+1);
         	fprintf(ofp, fmt, " ");
 
@@ -5882,10 +8135,13 @@ show_member_offset(FILE *ofp, struct datatype_member *dm, char *inbuf)
                 dm->flags &= ~(IN_UNION|IN_STRUCT);
 	}
 
-	sprintf(buf1, *gdb_output_radix == 10 ?  "  [%ld]" : "  [0x%lx]", offset);
+	if (dm->vaddr)
+		sprintf(buf1, "  [%lx]", offset + dm->vaddr);
+	else
+		sprintf(buf1, *gdb_output_radix == 10 ?  "  [%ld]" : "  [0x%lx]", offset);
 	sprintf(fmt, "%c%ds", '%', len);
 	fprintf(ofp, fmt, buf1);
-	fprintf(ofp, &inbuf[3]);
+	fprintf(ofp, "%s", &inbuf[3]);
 
 	return TRUE;
 
@@ -6123,6 +8379,8 @@ builtin_array_length(char *s, int len, int *two_dim)
 		lenptr = &array_table.kmem_cache_node;
 	else if (STREQ(s, "kmem_cache.cpu_slab"))
 		lenptr = &array_table.kmem_cache_cpu_slab;
+	else if (STREQ(s, "rt_prio_array.queue"))
+		lenptr = &array_table.rt_prio_array_queue;
 
 	if (!lenptr)                /* not stored */
 		return(len);        
@@ -6184,6 +8442,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(task_struct_pid));
 	fprintf(fp, "             task_struct_state: %ld\n", 
 		OFFSET(task_struct_state));
+	fprintf(fp, "        task_struct_exit_state: %ld\n", 
+		OFFSET(task_struct_exit_state));
 	fprintf(fp, "              task_struct_comm: %ld\n", 
 		OFFSET(task_struct_comm));
 	fprintf(fp, "                task_struct_mm: %ld\n", 
@@ -6206,6 +8466,16 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(task_struct_thread_esp));
         fprintf(fp, "        task_struct_thread_ksp: %ld\n",
                 OFFSET(task_struct_thread_ksp));
+        fprintf(fp, "      task_struct_thread_reg29: %ld\n",
+                OFFSET(task_struct_thread_reg29));
+        fprintf(fp, "      task_struct_thread_reg31: %ld\n",
+                OFFSET(task_struct_thread_reg31));
+	fprintf(fp, " task_struct_thread_context_fp: %ld\n",
+		OFFSET(task_struct_thread_context_fp));
+	fprintf(fp, " task_struct_thread_context_sp: %ld\n",
+		OFFSET(task_struct_thread_context_sp));
+	fprintf(fp, " task_struct_thread_context_pc: %ld\n",
+		OFFSET(task_struct_thread_context_pc));
 	fprintf(fp, "         task_struct_processor: %ld\n", 
 		OFFSET(task_struct_processor));
 	fprintf(fp, "            task_struct_p_pptr: %ld\n",
@@ -6250,6 +8520,10 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(task_struct_tgid));
         fprintf(fp, "         task_struct_namespace: %ld\n",
                 OFFSET(task_struct_namespace));
+        fprintf(fp, "          task_struct_rss_stat: %ld\n",
+                OFFSET(task_struct_rss_stat));
+        fprintf(fp, "           task_rss_stat_count: %ld\n",
+                OFFSET(task_rss_stat_count));
         fprintf(fp, "              task_struct_pids: %ld\n",
                 OFFSET(task_struct_pids));
         fprintf(fp, "          task_struct_last_run: %ld\n",
@@ -6258,16 +8532,24 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(task_struct_timestamp));
         fprintf(fp, "        task_struct_sched_info: %ld\n",
                 OFFSET(task_struct_sched_info));
+        fprintf(fp, "                task_struct_rt: %ld\n",
+                OFFSET(task_struct_rt));
+        fprintf(fp, "      sched_rt_entity_run_list: %ld\n",
+                OFFSET(sched_rt_entity_run_list));
 	fprintf(fp, "       sched_info_last_arrival: %ld\n",
                 OFFSET(sched_info_last_arrival));
         fprintf(fp, "       task_struct_thread_info: %ld\n",
                 OFFSET(task_struct_thread_info));
+        fprintf(fp, "             task_struct_stack: %ld\n",
+                OFFSET(task_struct_stack));
         fprintf(fp, "           task_struct_nsproxy: %ld\n",
                 OFFSET(task_struct_nsproxy));
         fprintf(fp, "              task_struct_rlim: %ld\n",
                 OFFSET(task_struct_rlim));
         fprintf(fp, "              task_struct_prio: %ld\n",
                 OFFSET(task_struct_prio));
+        fprintf(fp, "             task_struct_on_rq: %ld\n",
+                OFFSET(task_struct_on_rq));
 
 	fprintf(fp, "              thread_info_task: %ld\n",
                 OFFSET(thread_info_task));
@@ -6325,6 +8607,8 @@ dump_offset_table(char *spec, ulong makestruct)
 
 	fprintf(fp, "           signal_struct_count: %ld\n",
         	OFFSET(signal_struct_count));
+	fprintf(fp, "      signal_struct_nr_threads: %ld\n",
+        	OFFSET(signal_struct_nr_threads));
 	fprintf(fp, "          signal_struct_action: %ld\n",
         	OFFSET(signal_struct_action));
 	fprintf(fp, "  signal_struct_shared_pending: %ld\n",
@@ -6347,6 +8631,11 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(tms_tms_utime));
         fprintf(fp, "                 tms_tms_stime: %ld\n",
                 OFFSET(tms_tms_stime));
+
+	fprintf(fp, "              timekeeper_xtime: %ld\n",
+		OFFSET(timekeeper_xtime));
+	fprintf(fp, "          timekeeper_xtime_sec: %ld\n",
+		OFFSET(timekeeper_xtime_sec));
 
 	fprintf(fp, "                k_sigaction_sa: %ld\n",
         	OFFSET(k_sigaction_sa));
@@ -6449,6 +8738,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(mm_struct_mmap));
 	fprintf(fp, "                 mm_struct_pgd: %ld\n", 
 		OFFSET(mm_struct_pgd));
+	fprintf(fp, "            mm_struct_mm_count: %ld\n", 
+		OFFSET(mm_struct_mm_count));
 	fprintf(fp, "                 mm_struct_rss: %ld\n", 
 		OFFSET(mm_struct_rss));
 	fprintf(fp, "            mm_struct_anon_rss: %ld\n", 
@@ -6497,6 +8788,17 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "                vm_struct_next: %ld\n",
         	OFFSET(vm_struct_next));
 
+	fprintf(fp, "            vmap_area_va_start: %ld\n", 
+		OFFSET(vmap_area_va_start));
+	fprintf(fp, "              vmap_area_va_end: %ld\n", 
+		OFFSET(vmap_area_va_end));
+	fprintf(fp, "                vmap_area_list: %ld\n", 
+		OFFSET(vmap_area_list));
+	fprintf(fp, "                  vmap_area_vm: %ld\n", 
+		OFFSET(vmap_area_vm));
+	fprintf(fp, "               vmap_area_flags: %ld\n", 
+		OFFSET(vmap_area_flags));
+
 	fprintf(fp, "         module_size_of_struct: %ld\n", 
 		OFFSET(module_size_of_struct));
 	fprintf(fp, "                   module_next: %ld\n", 
@@ -6525,6 +8827,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(module_core_size));
 	fprintf(fp, "         module_core_text_size: %ld\n",
 		OFFSET(module_core_text_size));
+	fprintf(fp, "         module_init_size: %ld\n",
+		OFFSET(module_init_size));
 	fprintf(fp, "         module_init_text_size: %ld\n",
 		OFFSET(module_init_text_size));
 	fprintf(fp, "            module_module_init: %ld\n",
@@ -6535,6 +8839,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(module_symtab));
 	fprintf(fp, "                 module_strtab: %ld\n",
 		OFFSET(module_strtab));
+	fprintf(fp, "                 module_percpu: %ld\n",
+		OFFSET(module_percpu));
 
 	fprintf(fp, "             module_sect_attrs: %ld\n",
 		OFFSET(module_sect_attrs));
@@ -6582,6 +8888,16 @@ dump_offset_table(char *spec, ulong makestruct)
         fprintf(fp, "     kallsyms_section_name_off: %ld\n",
         	OFFSET(kallsyms_section_name_off));
 
+	fprintf(fp, "                 module_taints: %ld\n",
+		OFFSET(module_taints));
+	fprintf(fp, "          module_license_gplok: %ld\n",
+		OFFSET(module_license_gplok));
+	fprintf(fp, "              module_gpgsig_ok: %ld\n",
+		OFFSET(module_gpgsig_ok));
+	fprintf(fp, "                       tnt_bit: %ld\n", OFFSET(tnt_bit));
+	fprintf(fp, "                      tnt_true: %ld\n", OFFSET(tnt_true));
+	fprintf(fp, "                     tnt_false: %ld\n", OFFSET(tnt_false));
+
 	fprintf(fp, "                     page_next: %ld\n", OFFSET(page_next));
 	fprintf(fp, "                     page_prev: %ld\n", OFFSET(page_prev));
 	fprintf(fp, "                page_next_hash: %ld\n", 
@@ -6617,10 +8933,23 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(page_objects));
         fprintf(fp, "                     page_slab: %ld\n",
                 OFFSET(page_slab));
+        fprintf(fp, "                page_slab_page: %ld\n",
+                OFFSET(page_slab_page));
         fprintf(fp, "               page_first_page: %ld\n",
                 OFFSET(page_first_page));
         fprintf(fp, "                 page_freelist: %ld\n",
                 OFFSET(page_freelist));
+        fprintf(fp, "                    page_s_mem: %ld\n",
+                OFFSET(page_s_mem));
+        fprintf(fp, "                   page_active: %ld\n",
+                OFFSET(page_active));
+        fprintf(fp, "            page_compound_head: %ld\n",
+                OFFSET(page_compound_head));
+
+	fprintf(fp, "        trace_print_flags_mask: %ld\n",
+		OFFSET(trace_print_flags_mask));
+	fprintf(fp, "        trace_print_flags_name: %ld\n",
+		OFFSET(trace_print_flags_name));
 
         fprintf(fp, "    swap_info_struct_swap_file: %ld\n",
 		OFFSET(swap_info_struct_swap_file));
@@ -6650,6 +8979,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(block_device_bd_disk));
 	fprintf(fp, "         address_space_nrpages: %ld\n",
 		OFFSET(address_space_nrpages));
+	fprintf(fp, "       address_space_page_tree: %ld\n",
+		OFFSET(address_space_page_tree));
 	fprintf(fp, "                 gendisk_major: %ld\n",
 		OFFSET(gendisk_major));
 	fprintf(fp, "                  gendisk_fops: %ld\n",
@@ -6674,6 +9005,21 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(irqdesc_ctl));
 	fprintf(fp, "                 irqdesc_level: %ld\n",
 		OFFSET(irqdesc_level));
+
+	fprintf(fp, "           irq_desc_t_irq_data: %ld\n",
+		OFFSET(irq_desc_t_irq_data));
+	fprintf(fp, "         irq_desc_t_kstat_irqs: %ld\n",
+		OFFSET(irq_desc_t_kstat_irqs));
+	fprintf(fp, "           irq_desc_t_affinity: %ld\n",
+		OFFSET(irq_desc_t_affinity));
+	fprintf(fp, "                 irq_data_chip: %ld\n",
+		OFFSET(irq_data_chip));
+	fprintf(fp, "             irq_data_affinity: %ld\n",
+		OFFSET(irq_data_affinity));
+	fprintf(fp, "             irq_desc_irq_data: %ld\n",
+		OFFSET(irq_desc_irq_data));
+	fprintf(fp, "              kernel_stat_irqs: %ld\n",
+		OFFSET(kernel_stat_irqs));
 
 	fprintf(fp, "             irqaction_handler: %ld\n",
 		OFFSET(irqaction_handler));
@@ -6825,6 +9171,16 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(vfsmount_mnt_mountpoint));
         fprintf(fp, "           vfsmount_mnt_parent: %ld\n", 
 		OFFSET(vfsmount_mnt_parent));
+	fprintf(fp, "              mount_mnt_parent: %ld\n",
+		OFFSET(mount_mnt_parent));
+	fprintf(fp, "          mount_mnt_mountpoint: %ld\n",
+		OFFSET(mount_mnt_mountpoint));
+	fprintf(fp, "                mount_mnt_list: %ld\n",
+		OFFSET(mount_mnt_list));
+	fprintf(fp, "             mount_mnt_devname: %ld\n",
+		OFFSET(mount_mnt_devname));
+	fprintf(fp, "                     mount_mnt: %ld\n",
+		OFFSET(mount_mnt));
 	fprintf(fp, "                namespace_root: %ld\n",
 			OFFSET(namespace_root));
 	fprintf(fp, "                namespace_list: %ld\n",
@@ -6977,6 +9333,10 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(kmem_cache_node));
         fprintf(fp, "           kmem_cache_cpu_slab: %ld\n",
                 OFFSET(kmem_cache_cpu_slab));
+        fprintf(fp, "        kmem_cache_cpu_partial: %ld\n",
+                OFFSET(kmem_cache_cpu_partial));
+        fprintf(fp, "          kmem_cache_cpu_cache: %ld\n",
+                OFFSET(kmem_cache_cpu_cache));
         fprintf(fp, "                 kmem_cache_oo: %ld\n",
                 OFFSET(kmem_cache_oo));
 
@@ -6988,6 +9348,8 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(kmem_cache_node_partial));
         fprintf(fp, "          kmem_cache_node_full: %ld\n",
                 OFFSET(kmem_cache_node_full));
+        fprintf(fp, "          kmem_cache_node_total_objects: %ld\n",
+                OFFSET(kmem_cache_node_total_objects));
 
         fprintf(fp, "       kmem_cache_cpu_freelist: %ld\n",
                 OFFSET(kmem_cache_cpu_freelist));
@@ -7042,6 +9404,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(sock_sk_type));
         fprintf(fp, "        sock_common_skc_family: %ld\n", 
 		OFFSET(sock_common_skc_family));
+	fprintf(fp, "        socket_alloc_vfs_inode: %ld\n",
+		OFFSET(socket_alloc_vfs_inode));
         fprintf(fp, "                inet_sock_inet: %ld\n", 
 		OFFSET(inet_sock_inet));
         fprintf(fp, "                inet_opt_daddr: %ld\n", 
@@ -7080,6 +9444,8 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(tvec_s_vec));
         fprintf(fp, "             tvec_t_base_s_tv1: %ld\n",
                 OFFSET(tvec_t_base_s_tv1));
+	fprintf(fp, "            timer_base_vectors: %ld\n",
+                OFFSET(timer_base_vectors));
 
         fprintf(fp, "               wait_queue_task: %ld\n", 
         	OFFSET(wait_queue_task));
@@ -7206,6 +9572,12 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(neighbour_nud_state));
         fprintf(fp, "      neigh_table_hash_buckets: %ld\n",
 		OFFSET(neigh_table_hash_buckets));
+        fprintf(fp, "         neigh_table_hash_mask: %ld\n",
+		OFFSET(neigh_table_hash_mask));
+        fprintf(fp, "        neigh_table_hash_shift: %ld\n",
+		OFFSET(neigh_table_hash_shift));
+        fprintf(fp, "           neigh_table_nht_ptr: %ld\n",
+		OFFSET(neigh_table_nht_ptr));
         fprintf(fp, "           neigh_table_key_len: %ld\n",
 		OFFSET(neigh_table_key_len));
 
@@ -7271,10 +9643,18 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(cpu_s_curr));
 	fprintf(fp, "              prio_array_queue: %ld\n",
 		OFFSET(prio_array_queue));
+	fprintf(fp, "           rt_prio_array_queue: %ld\n",
+		OFFSET(rt_prio_array_queue));
 	fprintf(fp, "          prio_array_nr_active: %ld\n",
 		OFFSET(prio_array_nr_active));
+	fprintf(fp, "                  pt_regs_regs: %ld\n",
+		OFFSET(pt_regs_regs));
+	fprintf(fp, "          pt_regs_cp0_badvaddr: %ld\n",
+		OFFSET(pt_regs_cp0_badvaddr));
 	fprintf(fp, "          user_regs_struct_ebp: %ld\n",
 		OFFSET(user_regs_struct_ebp));
+	fprintf(fp, "          user_regs_struct_eip: %ld\n",
+		OFFSET(user_regs_struct_eip));
 	fprintf(fp, "          user_regs_struct_esp: %ld\n",
 		OFFSET(user_regs_struct_esp));
 	fprintf(fp, "          user_regs_struct_rip: %ld\n",
@@ -7287,6 +9667,58 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(user_regs_struct_cs));
 	fprintf(fp, "           user_regs_struct_ss: %ld\n",
 		OFFSET(user_regs_struct_ss));
+	fprintf(fp, "          user_regs_struct_eip: %ld\n",
+		OFFSET(user_regs_struct_eip));
+	fprintf(fp, "          user_regs_struct_rax: %ld\n",
+		OFFSET(user_regs_struct_rax));
+	fprintf(fp, "          user_regs_struct_eax: %ld\n",
+		OFFSET(user_regs_struct_eax));
+	fprintf(fp, "          user_regs_struct_rbx: %ld\n",
+		OFFSET(user_regs_struct_rbx));
+	fprintf(fp, "          user_regs_struct_ebx: %ld\n",
+		OFFSET(user_regs_struct_ebx));
+	fprintf(fp, "          user_regs_struct_rcx: %ld\n",
+		OFFSET(user_regs_struct_rcx));
+	fprintf(fp, "          user_regs_struct_ecx: %ld\n",
+		OFFSET(user_regs_struct_ecx));
+	fprintf(fp, "          user_regs_struct_rdx: %ld\n",
+		OFFSET(user_regs_struct_rdx));
+	fprintf(fp, "          user_regs_struct_edx: %ld\n",
+		OFFSET(user_regs_struct_edx));
+	fprintf(fp, "          user_regs_struct_rsi: %ld\n",
+		OFFSET(user_regs_struct_rsi));
+	fprintf(fp, "          user_regs_struct_esi: %ld\n",
+		OFFSET(user_regs_struct_esi));
+	fprintf(fp, "          user_regs_struct_rdi: %ld\n",
+		OFFSET(user_regs_struct_rdi));
+	fprintf(fp, "          user_regs_struct_edi: %ld\n",
+		OFFSET(user_regs_struct_edi));
+	fprintf(fp, "           user_regs_struct_ds: %ld\n",
+		OFFSET(user_regs_struct_ds));
+	fprintf(fp, "           user_regs_struct_es: %ld\n",
+		OFFSET(user_regs_struct_es));
+	fprintf(fp, "           user_regs_struct_fs: %ld\n",
+		OFFSET(user_regs_struct_fs));
+	fprintf(fp, "           user_regs_struct_gs: %ld\n",
+		OFFSET(user_regs_struct_gs));
+	fprintf(fp, "          user_regs_struct_rbp: %ld\n",
+		OFFSET(user_regs_struct_rbp));
+	fprintf(fp, "           user_regs_struct_r8: %ld\n",
+		OFFSET(user_regs_struct_r8));
+	fprintf(fp, "           user_regs_struct_r9: %ld\n",
+		OFFSET(user_regs_struct_r9));
+	fprintf(fp, "          user_regs_struct_r10: %ld\n",
+		OFFSET(user_regs_struct_r10));
+	fprintf(fp, "          user_regs_struct_r11: %ld\n",
+		OFFSET(user_regs_struct_r11));
+	fprintf(fp, "          user_regs_struct_r12: %ld\n",
+		OFFSET(user_regs_struct_r12));
+	fprintf(fp, "          user_regs_struct_r13: %ld\n",
+		OFFSET(user_regs_struct_r13));
+	fprintf(fp, "          user_regs_struct_r14: %ld\n",
+		OFFSET(user_regs_struct_r14));
+	fprintf(fp, "          user_regs_struct_r15: %ld\n",
+		OFFSET(user_regs_struct_r15));
 
 	fprintf(fp, "                e820map_nr_map: %ld\n",
 		OFFSET(e820map_nr_map));
@@ -7332,6 +9764,17 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(radix_tree_root_height));
         fprintf(fp, "         radix_tree_root_rnode: %ld\n",
                 OFFSET(radix_tree_root_rnode));
+        fprintf(fp, "         radix_tree_node_slots: %ld\n",
+                OFFSET(radix_tree_node_slots));
+        fprintf(fp, "        radix_tree_node_height: %ld\n",
+                OFFSET(radix_tree_node_height));
+
+        fprintf(fp, "               rb_root_rb_node: %ld\n",
+                OFFSET(rb_root_rb_node));
+        fprintf(fp, "               rb_node_rb_left: %ld\n",
+                OFFSET(rb_node_rb_left));
+        fprintf(fp, "              rb_node_rb_right: %ld\n",
+                OFFSET(rb_node_rb_right));
 
 	fprintf(fp, "            x8664_pda_pcurrent: %ld\n",
 		OFFSET(x8664_pda_pcurrent));
@@ -7382,12 +9825,22 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(rq_cfs));
 	fprintf(fp, "                         rq_rt: %ld\n",
 		OFFSET(rq_rt));
+	fprintf(fp, "                   cfs_rq_curr: %ld\n",
+		OFFSET(cfs_rq_curr));
 	fprintf(fp, "                 rq_nr_running: %ld\n",
 		OFFSET(rq_nr_running));
+	fprintf(fp, "                  rq_timestamp: %ld\n",
+		OFFSET(rq_timestamp));
 	fprintf(fp, "                task_struct_se: %ld\n",
 		OFFSET(task_struct_se));
 	fprintf(fp, "         sched_entity_run_node: %ld\n",
 		OFFSET(sched_entity_run_node));
+	fprintf(fp, "           sched_entity_cfs_rq: %ld\n",
+		OFFSET(sched_entity_cfs_rq));
+	fprintf(fp, "             sched_entity_my_q: %ld\n",
+		OFFSET(sched_entity_my_q));
+	fprintf(fp, "            sched_entity_on_rq: %ld\n",
+		OFFSET(sched_entity_on_rq));
 	fprintf(fp, "             cfs_rq_nr_running: %ld\n",
 		OFFSET(cfs_rq_nr_running));
 	fprintf(fp, "            cfs_rq_rb_leftmost: %ld\n",
@@ -7404,10 +9857,271 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(vcpu_struct_rq));
 	fprintf(fp, "    s390_lowcore_psw_save_area: %ld\n",
 		OFFSET(s390_lowcore_psw_save_area));
+	fprintf(fp, "   s390_stack_frame_back_chain: %ld\n",
+		OFFSET(s390_stack_frame_back_chain));
+	fprintf(fp, "          s390_stack_frame_r14: %ld\n",
+		OFFSET(s390_stack_frame_r14));
+
+	fprintf(fp, "           cpu_context_save_fp: %ld\n",
+		OFFSET(cpu_context_save_fp));
+	fprintf(fp, "           cpu_context_save_sp: %ld\n",
+		OFFSET(cpu_context_save_sp));
+	fprintf(fp, "           cpu_context_save_pc: %ld\n",
+		OFFSET(cpu_context_save_pc));
+	fprintf(fp, "           elf_prstatus_pr_pid: %ld\n",
+		OFFSET(elf_prstatus_pr_pid));
+	fprintf(fp, "           elf_prstatus_pr_reg: %ld\n",
+		OFFSET(elf_prstatus_pr_reg));
+	fprintf(fp, "               irq_desc_t_name: %ld\n",
+		OFFSET(irq_desc_t_name));
+	fprintf(fp, "       thread_info_cpu_context: %ld\n",
+		OFFSET(thread_info_cpu_context));
+	fprintf(fp, "             unwind_table_list: %ld\n",
+		OFFSET(unwind_table_list));
+	fprintf(fp, "            unwind_table_start: %ld\n",
+		OFFSET(unwind_table_start));
+	fprintf(fp, "             unwind_table_stop: %ld\n",
+		OFFSET(unwind_table_stop));
+	fprintf(fp, "       unwind_table_begin_addr: %ld\n",
+		OFFSET(unwind_table_begin_addr));
+	fprintf(fp, "         unwind_table_end_addr: %ld\n",
+		OFFSET(unwind_table_end_addr));
+	fprintf(fp, "               unwind_idx_addr: %ld\n",
+		OFFSET(unwind_idx_addr));
+	fprintf(fp, "               unwind_idx_insn: %ld\n",
+		OFFSET(unwind_idx_insn));
+	fprintf(fp, "                 class_devices: %ld\n",
+		OFFSET(class_devices));
+	fprintf(fp, "                       class_p: %ld\n",
+		OFFSET(class_p));
+	fprintf(fp, "         class_private_devices: %ld\n",
+		OFFSET(class_private_devices));
+	fprintf(fp, "            device_knode_class: %ld\n",
+		OFFSET(device_knode_class));
+	fprintf(fp, "                   device_node: %ld\n",
+		OFFSET(device_node));
+	fprintf(fp, "                   gendisk_dev: %ld\n",
+		OFFSET(gendisk_dev));
+	fprintf(fp, "                  gendisk_kobj: %ld\n",
+		OFFSET(gendisk_kobj));
+	fprintf(fp, "                 gendisk_part0: %ld\n",
+		OFFSET(gendisk_part0));
+	fprintf(fp, "                 gendisk_queue: %ld\n",
+		OFFSET(gendisk_queue));
+	fprintf(fp, "                 hd_struct_dev: %ld\n",
+		OFFSET(hd_struct_dev));
+	fprintf(fp, "                  klist_k_list: %ld\n",
+		OFFSET(klist_k_list));
+	fprintf(fp, "            klist_node_n_klist: %ld\n",
+		OFFSET(klist_node_n_klist));
+	fprintf(fp, "             klist_node_n_node: %ld\n",
+		OFFSET(klist_node_n_node));
+	fprintf(fp, "                 kobject_entry: %ld\n",
+		OFFSET(kobject_entry));
+	fprintf(fp, "                     kset_list: %ld\n",
+		OFFSET(kset_list));
+	fprintf(fp, "            request_list_count: %ld\n",
+		OFFSET(request_list_count));
+	fprintf(fp, "       request_queue_in_flight: %ld\n",
+		OFFSET(request_queue_in_flight));
+	fprintf(fp, "              request_queue_rq: %ld\n",
+		OFFSET(request_queue_rq));
+	fprintf(fp, "          request_queue_mq_ops: %ld\n",
+		OFFSET(request_queue_mq_ops));
+	fprintf(fp, "       request_queue_queue_ctx: %ld\n",
+		OFFSET(request_queue_queue_ctx));
+	fprintf(fp, "      blk_mq_ctx_rq_dispatched: %ld\n",
+		OFFSET(blk_mq_ctx_rq_dispatched));
+	fprintf(fp, "       blk_mq_ctx_rq_completed: %ld\n",
+		OFFSET(blk_mq_ctx_rq_completed));
+	fprintf(fp, "  subsys_private_klist_devices: %ld\n",
+		OFFSET(subsys_private_klist_devices));
+	fprintf(fp, "                subsystem_kset: %ld\n",
+		OFFSET(subsystem_kset));
+
+	fprintf(fp, "                     file_f_op: %ld\n",
+		OFFSET(file_f_op));
+	fprintf(fp, "             file_private_data: %ld\n",
+		OFFSET(file_private_data));
+
+	fprintf(fp, "                  hstate_order: %ld\n",
+		OFFSET(hstate_order));
+	fprintf(fp, "          hstate_nr_huge_pages: %ld\n",
+		OFFSET(hstate_nr_huge_pages));
+	fprintf(fp, "        hstate_free_huge_pages: %ld\n",
+		OFFSET(hstate_free_huge_pages));
+	fprintf(fp, "                   hstate_name: %ld\n",
+		OFFSET(hstate_name));
+
+	fprintf(fp, "      hugetlbfs_sb_info_hstate: %ld\n",
+		OFFSET(hugetlbfs_sb_info_hstate));
+	fprintf(fp, "                 idr_layer_ary: %ld\n",
+		OFFSET(idr_layer_ary));
+	fprintf(fp, "               idr_layer_layer: %ld\n",
+		OFFSET(idr_layer_layer));
+	fprintf(fp, "                    idr_layers: %ld\n",
+		OFFSET(idr_layers));
+	fprintf(fp, "                       idr_top: %ld\n",
+		OFFSET(idr_top));
+	fprintf(fp, "                  ipc_id_ary_p: %ld\n",
+		OFFSET(ipc_id_ary_p));
+	fprintf(fp, "               ipc_ids_entries: %ld\n",
+		OFFSET(ipc_ids_entries));
+	fprintf(fp, "                ipc_ids_max_id: %ld\n",
+		OFFSET(ipc_ids_max_id));
+	fprintf(fp, "              ipc_ids_ipcs_idr: %ld\n",
+		OFFSET(ipc_ids_ipcs_idr));
+	fprintf(fp, "                ipc_ids_in_use: %ld\n",
+		OFFSET(ipc_ids_in_use));
+	fprintf(fp, "             ipc_namespace_ids: %ld\n",
+		OFFSET(ipc_namespace_ids));
+	fprintf(fp, "         kern_ipc_perm_deleted: %ld\n",
+		OFFSET(kern_ipc_perm_deleted));
+	fprintf(fp, "             kern_ipc_perm_key: %ld\n",
+		OFFSET(kern_ipc_perm_key));
+	fprintf(fp, "            kern_ipc_perm_mode: %ld\n",
+		OFFSET(kern_ipc_perm_mode));
+	fprintf(fp, "             kern_ipc_perm_uid: %ld\n",
+		OFFSET(kern_ipc_perm_uid));
+	fprintf(fp, "              kern_ipc_perm_id: %ld\n",
+		OFFSET(kern_ipc_perm_id));
+	fprintf(fp, "             kern_ipc_perm_seq: %ld\n",
+		OFFSET(kern_ipc_perm_seq));
+	fprintf(fp, "                nsproxy_ipc_ns: %ld\n",
+		OFFSET(nsproxy_ipc_ns));
+	fprintf(fp, "                nsproxy_net_ns: %ld\n",
+		OFFSET(nsproxy_net_ns));
+	fprintf(fp, "      shmem_inode_info_swapped: %ld\n",
+		OFFSET(shmem_inode_info_swapped));
+	fprintf(fp, "    shmem_inode_info_vfs_inode: %ld\n",
+		OFFSET(shmem_inode_info_vfs_inode));
+	fprintf(fp, "            shm_file_data_file: %ld\n",
+		OFFSET(shm_file_data_file));
+	fprintf(fp, "         shmid_kernel_shm_file: %ld\n",
+		OFFSET(shmid_kernel_shm_file));
+	fprintf(fp, "       shmid_kernel_shm_nattch: %ld\n",
+		OFFSET(shmid_kernel_shm_nattch));
+	fprintf(fp, "         shmid_kernel_shm_perm: %ld\n",
+		OFFSET(shmid_kernel_shm_perm));
+	fprintf(fp, "        shmid_kernel_shm_segsz: %ld\n",
+		OFFSET(shmid_kernel_shm_segsz));
+	fprintf(fp, "               shmid_kernel_id: %ld\n",
+		OFFSET(shmid_kernel_id));
+	fprintf(fp, "            sem_array_sem_perm: %ld\n",
+		OFFSET(sem_array_sem_perm));
+	fprintf(fp, "              sem_array_sem_id: %ld\n",
+		OFFSET(sem_array_sem_id));
+	fprintf(fp, "           sem_array_sem_nsems: %ld\n",
+		OFFSET(sem_array_sem_nsems));
+	fprintf(fp, "              msg_queue_q_perm: %ld\n",
+		OFFSET(msg_queue_q_perm));
+	fprintf(fp, "                msg_queue_q_id: %ld\n",
+		OFFSET(msg_queue_q_id));
+	fprintf(fp, "            msg_queue_q_cbytes: %ld\n",
+		OFFSET(msg_queue_q_cbytes));
+	fprintf(fp, "              msg_queue_q_qnum: %ld\n",
+		OFFSET(msg_queue_q_qnum));
+	fprintf(fp, "         super_block_s_fs_info: %ld\n",
+		OFFSET(super_block_s_fs_info));
+	fprintf(fp, "                   log_ts_nsec: %ld\n",
+		OFFSET(log_ts_nsec));
+	fprintf(fp, "                       log_len: %ld\n",
+		OFFSET(log_len));
+	fprintf(fp, "                  log_text_len: %ld\n",
+		OFFSET(log_text_len));
+	fprintf(fp, "                  log_dict_len: %ld\n",
+		OFFSET(log_dict_len));
+	fprintf(fp, "                     log_level: %ld\n",
+		OFFSET(log_level));
+	fprintf(fp, "               log_flags_level: %ld\n",
+		OFFSET(log_flags_level));
+	fprintf(fp, "          sched_rt_entity_my_q: %ld\n",
+		OFFSET(sched_rt_entity_my_q));
+	fprintf(fp, "             task_group_parent: %ld\n",
+		OFFSET(task_group_parent));
+	fprintf(fp, "                task_group_css: %ld\n",
+		OFFSET(task_group_css));
+	fprintf(fp, "    cgroup_subsys_state_cgroup: %ld\n",
+		OFFSET(cgroup_subsys_state_cgroup));
+	fprintf(fp, "                 cgroup_dentry: %ld\n",
+		OFFSET(cgroup_dentry));
+	fprintf(fp, "                     cgroup_kn: %ld\n",
+		OFFSET(cgroup_kn));
+	fprintf(fp, "              kernfs_node_name: %ld\n",
+		OFFSET(kernfs_node_name));
+	fprintf(fp, "            kernfs_node_parent: %ld\n",
+		OFFSET(kernfs_node_parent));
+	fprintf(fp, "              task_group_rt_rq: %ld\n",
+		OFFSET(task_group_rt_rq));
+	fprintf(fp, "                      rt_rq_tg: %ld\n",
+		OFFSET(rt_rq_tg));
+	fprintf(fp, "             task_group_cfs_rq: %ld\n",
+		OFFSET(task_group_cfs_rq));
+	fprintf(fp, "                     cfs_rq_tg: %ld\n",
+		OFFSET(cfs_rq_tg));
+	fprintf(fp, "           task_group_siblings: %ld\n",
+		OFFSET(task_group_siblings));
+	fprintf(fp, "           task_group_children: %ld\n",
+		OFFSET(task_group_children));
+	fprintf(fp, "      task_group_cfs_bandwidth: %ld\n",
+		OFFSET(task_group_cfs_bandwidth));
+	fprintf(fp, "              cfs_rq_throttled: %ld\n",
+		OFFSET(cfs_rq_throttled));
+	fprintf(fp, "       task_group_rt_bandwidth: %ld\n",
+		OFFSET(task_group_rt_bandwidth));
+	fprintf(fp, "            rt_rq_rt_throttled: %ld\n",
+		OFFSET(rt_rq_rt_throttled));
+	fprintf(fp, "            rt_rq_highest_prio: %ld\n",
+		OFFSET(rt_rq_highest_prio));
+	fprintf(fp, "           rt_rq_rt_nr_running: %ld\n",
+		OFFSET(rt_rq_rt_nr_running));
+	fprintf(fp, "   hrtimer_cpu_base_clock_base: %ld\n",
+		OFFSET(hrtimer_cpu_base_clock_base));
+	fprintf(fp, "     hrtimer_clock_base_offset: %ld\n",
+		OFFSET(hrtimer_clock_base_offset));
+	fprintf(fp, "     hrtimer_clock_base_active: %ld\n",
+		OFFSET(hrtimer_clock_base_active));
+	fprintf(fp, "      hrtimer_clock_base_first: %ld\n",
+		OFFSET(hrtimer_clock_base_first));
+	fprintf(fp, "   hrtimer_clock_base_get_time: %ld\n",
+		OFFSET(hrtimer_clock_base_get_time));
+	fprintf(fp, "            hrtimer_base_first: %ld\n",
+		OFFSET(hrtimer_base_first));
+	fprintf(fp, "          hrtimer_base_pending: %ld\n",
+		OFFSET(hrtimer_base_pending));
+	fprintf(fp, "         hrtimer_base_get_time: %ld\n",
+		OFFSET(hrtimer_base_get_time));
+	fprintf(fp, "                  hrtimer_node: %ld\n",
+		OFFSET(hrtimer_node));
+	fprintf(fp, "                  hrtimer_list: %ld\n",
+		OFFSET(hrtimer_list));
+	fprintf(fp, "           hrtimer_softexpires: %ld\n",
+		OFFSET(hrtimer_softexpires));
+	fprintf(fp, "               hrtimer_expires: %ld\n",
+		OFFSET(hrtimer_expires));
+	fprintf(fp, "              hrtimer_function: %ld\n",
+		OFFSET(hrtimer_function));
+	fprintf(fp, "          timerqueue_head_next: %ld\n",
+		OFFSET(timerqueue_head_next));
+	fprintf(fp, "       timerqueue_node_expires: %ld\n",
+		OFFSET(timerqueue_node_expires));
+	fprintf(fp, "          timerqueue_node_node: %ld\n",
+		OFFSET(timerqueue_node_node));
+	fprintf(fp, "                  ktime_t_tv64: %ld\n",
+		OFFSET(ktime_t_tv64));
+	fprintf(fp, "                   ktime_t_sec: %ld\n",
+		OFFSET(ktime_t_sec));
+	fprintf(fp, "                  ktime_t_nsec: %ld\n",
+		OFFSET(ktime_t_nsec));
+	fprintf(fp, "              atomic_t_counter: %ld\n",
+		OFFSET(atomic_t_counter));
+	fprintf(fp, "          percpu_counter_count: %ld\n",
+		OFFSET(percpu_counter_count));
 
 	fprintf(fp, "\n                    size_table:\n");
 	fprintf(fp, "                          page: %ld\n", SIZE(page));
 	fprintf(fp, "                    page_flags: %ld\n", SIZE(page_flags));
+	fprintf(fp, "             trace_print_flags: %ld\n", SIZE(trace_print_flags));
         fprintf(fp, "              free_area_struct: %ld\n", 
 		SIZE(free_area_struct));
         fprintf(fp, "                     free_area: %ld\n", 
@@ -7437,9 +10151,13 @@ dump_offset_table(char *spec, ulong makestruct)
 		SIZE(page_cache_bucket));
         fprintf(fp, "                       pt_regs: %ld\n", SIZE(pt_regs));
         fprintf(fp, "                   task_struct: %ld\n", SIZE(task_struct));
+        fprintf(fp, "             task_struct_flags: %ld\n", SIZE(task_struct_flags));
         fprintf(fp, "                   thread_info: %ld\n", SIZE(thread_info));
         fprintf(fp, "                 softirq_state: %ld\n", 
 		SIZE(softirq_state));
+        fprintf(fp, "                softirq_action: %ld\n", 
+		SIZE(softirq_action));
+
         fprintf(fp, "                   desc_struct: %ld\n", SIZE(desc_struct));
 	fprintf(fp, "                       umode_t: %ld\n", SIZE(umode_t));
 	fprintf(fp, "                        dentry: %ld\n", SIZE(dentry));
@@ -7450,6 +10168,7 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "                          file: %ld\n", SIZE(file)); 
 	fprintf(fp, "                         inode: %ld\n", SIZE(inode)); 
 	fprintf(fp, "                      vfsmount: %ld\n", SIZE(vfsmount)); 
+	fprintf(fp, "                         mount: %ld\n", SIZE(mount));
 	fprintf(fp, "                   super_block: %ld\n", 
 		SIZE(super_block)); 
 	fprintf(fp, "                       irqdesc: %ld\n", SIZE(irqdesc));
@@ -7499,6 +10218,7 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "                      resource: %ld\n", SIZE(resource));
 	fprintf(fp, "                      runqueue: %ld\n", SIZE(runqueue));
 	fprintf(fp, "                    irq_desc_t: %ld\n", SIZE(irq_desc_t));
+	fprintf(fp, "                      irq_data: %ld\n", SIZE(irq_data));
 	fprintf(fp, "                    task_union: %ld\n", SIZE(task_union));
 	fprintf(fp, "                  thread_union: %ld\n", SIZE(thread_union));
 	fprintf(fp, "                    prio_array: %ld\n", SIZE(prio_array));
@@ -7576,6 +10296,58 @@ dump_offset_table(char *spec, ulong makestruct)
 		SIZE(probe));
 	fprintf(fp, "                      kobj_map: %ld\n", 
 		SIZE(kobj_map));
+	fprintf(fp, "              cpu_context_save: %ld\n", 
+		SIZE(cpu_context_save));
+	fprintf(fp, "                  elf_prstatus: %ld\n", 
+		SIZE(elf_prstatus));
+	fprintf(fp, "                      note_buf: %ld\n", 
+		SIZE(note_buf));
+	fprintf(fp, "                    unwind_idx: %ld\n", 
+		SIZE(unwind_idx));
+	fprintf(fp, "              s390_stack_frame: %ld\n",
+		SIZE(s390_stack_frame));
+	fprintf(fp, "                   percpu_data: %ld\n",
+		SIZE(percpu_data));
+	fprintf(fp, "                  sched_entity: %ld\n",
+		SIZE(sched_entity));
+	fprintf(fp, "                   kernel_stat: %ld\n",
+		SIZE(kernel_stat));
+	fprintf(fp, "                     subsystem: %ld\n",
+		SIZE(subsystem));
+	fprintf(fp, "                 class_private: %ld\n",
+		SIZE(class_private));
+	fprintf(fp, "                  rq_in_flight: %ld\n",
+		SIZE(rq_in_flight));
+	fprintf(fp, "         class_private_devices: %ld\n",
+		SIZE(class_private_devices));
+	fprintf(fp, "                        hstate: %ld\n",
+		SIZE(hstate));
+	fprintf(fp, "                       ipc_ids: %ld\n",
+		SIZE(ipc_ids));
+	fprintf(fp, "                  shmid_kernel: %ld\n",
+		SIZE(shmid_kernel));
+	fprintf(fp, "                     sem_array: %ld\n",
+		SIZE(sem_array));
+	fprintf(fp, "                     msg_queue: %ld\n",
+		SIZE(msg_queue));
+	fprintf(fp, "                           log: %ld\n",
+		SIZE(log));
+	fprintf(fp, "                     log_level: %ld\n",
+		SIZE(log_level));
+	fprintf(fp, "                         rt_rq: %ld\n",
+		SIZE(rt_rq));
+	fprintf(fp, "                    task_group: %ld\n",
+		SIZE(task_group));
+	fprintf(fp, "                     vmap_area: %ld\n",
+		SIZE(vmap_area));
+	fprintf(fp, "            hrtimer_clock_base: %ld\n",
+		SIZE(hrtimer_clock_base));
+	fprintf(fp, "                  hrtimer_base: %ld\n",
+		SIZE(hrtimer_base));
+	fprintf(fp, "                    timer_base: %ld\n",
+		SIZE(timer_base));
+	fprintf(fp, "                           tnt: %ld\n",
+		SIZE(tnt));
 
         fprintf(fp, "\n                   array_table:\n");
 	/*
@@ -7635,6 +10407,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		ARRAY_LENGTH(kmem_cache_node));
 	fprintf(fp, "           kmem_cache_cpu_slab: %d\n",
 		ARRAY_LENGTH(kmem_cache_cpu_slab));
+        fprintf(fp, "           rt_prio_array_queue: %d\n",
+                ARRAY_LENGTH(rt_prio_array_queue));
 
 	if (spec) {
 		int in_size_table, in_array_table, arrays, offsets, sizes;
@@ -7677,7 +10451,7 @@ dump_offset_table(char *spec, ulong makestruct)
 				    strstr(buf, " offset_table:"))
 					break;
 		
-				fprintf(pc->saved_fp, buf);
+				fprintf(pc->saved_fp, "%s", buf);
 			}
 		}
 		close_tmpfile();
@@ -7836,6 +10610,7 @@ section_header_info(bfd *bfd, asection *section, void *reqptr)
 	struct load_module *lm;
 	ulong request;
         asection **sec;
+	ulong section_end_address;
 
 	request = ((ulong)reqptr);
 
@@ -7854,6 +10629,11 @@ section_header_info(bfd *bfd, asection *section, void *reqptr)
                 	kt->etext_init = kt->stext_init +
                         	(ulong)bfd_section_size(bfd, section);
 		}
+
+		if (STREQ(bfd_get_section_name(bfd, section), ".text")) {
+			st->first_section_start = (ulong)
+				bfd_get_section_vma(bfd, section);
+		}
                 if (STREQ(bfd_get_section_name(bfd, section), ".text") ||
                     STREQ(bfd_get_section_name(bfd, section), ".data")) {
                         if (!(bfd_get_section_flags(bfd, section) & SEC_LOAD))
@@ -7865,6 +10645,18 @@ section_header_info(bfd *bfd, asection *section, void *reqptr)
                 if (STREQ(bfd_get_section_name(bfd, section), ".eh_frame")) {
 			st->dwarf_eh_frame_file_offset = (off_t)section->filepos;
 			st->dwarf_eh_frame_size = (ulong)bfd_section_size(bfd, section);
+		}
+                if (STREQ(bfd_get_section_name(bfd, section), ".debug_frame")) {
+			st->dwarf_debug_frame_file_offset = (off_t)section->filepos;
+			st->dwarf_debug_frame_size = (ulong)bfd_section_size(bfd, section);
+		}
+
+		if (st->first_section_start != 0) {
+			section_end_address =
+				(ulong) bfd_get_section_vma(bfd, section) +
+				(ulong) bfd_section_size(bfd, section);
+			if (section_end_address > st->last_section_end)
+				st->last_section_end = section_end_address;
 		}
 		break;
 
@@ -7885,6 +10677,10 @@ section_header_info(bfd *bfd, asection *section, void *reqptr)
                 if (STREQ(bfd_get_section_name(bfd, section), ".eh_frame")) {
 			st->dwarf_eh_frame_file_offset = (off_t)section->filepos;
 			st->dwarf_eh_frame_size = (ulong)bfd_section_size(bfd, section);
+		}
+                if (STREQ(bfd_get_section_name(bfd, section), ".debug_frame")) {
+			st->dwarf_debug_frame_file_offset = (off_t)section->filepos;
+			st->dwarf_debug_frame_size = (ulong)bfd_section_size(bfd, section);
 		}
 		break;
 
@@ -7941,6 +10737,14 @@ store_section_data(struct load_module *lm, bfd *bfd, asection *section)
 	lm->mod_section_data[i].section = section;
 	lm->mod_section_data[i].priority = prio;
 	lm->mod_section_data[i].flags = section->flags & ~SEC_FOUND;
+	/* 
+	 * The percpu section isn't included in kallsyms or module_core area.
+	 */
+	if (lm->mod_percpu &&
+	    (STREQ(name,".data.percpu") || STREQ(name, ".data..percpu"))) {
+		lm->mod_percpu_size = bfd_section_size(bfd, section);
+		lm->mod_section_data[i].flags |= SEC_FOUND;
+	}
 	lm->mod_section_data[i].size = bfd_section_size(bfd, section);
 	lm->mod_section_data[i].offset = 0;
 	if (strlen(name) < MAX_MOD_SEC_NAME)
@@ -8069,7 +10873,7 @@ calculate_load_order_v2(struct load_module *lm, bfd *bfd, int dynamic,
 	void *minisyms, long symcount, unsigned int size)
 {
 	struct syment *s1, *s2;
-	ulong sec_start, sec_end;
+	ulong sec_start;
 	bfd_byte *from, *fromend;
 	asymbol *store;
 	asymbol *sym;
@@ -8156,13 +10960,13 @@ calculate_load_order_v2(struct load_module *lm, bfd *bfd, int dynamic,
 
             /* Update the offset information for the section */
 	    sec_start = s1->value - syminfo.value;
-	    sec_end = sec_start + lm->mod_section_data[i].size;
+//	    sec_end = sec_start + lm->mod_section_data[i].size;
 	    lm->mod_section_data[i].offset = sec_start - lm->mod_base;
             lm->mod_section_data[i].flags |= SEC_FOUND;
 
 	    if (CRASHDEBUG(2)) {
 		    fprintf(fp, "update sec offset sym %s @ %lx  val %lx  section %s\n",
-			    s1->name, s1->value, syminfo.value, secname);
+			    s1->name, s1->value, (ulong)syminfo.value, secname);
 	    }
 
 	    if (strcmp(secname, ".text") == 0)
@@ -8377,21 +11181,36 @@ add_symbol_file(struct load_module *lm)
 	req = &request;
 	BZERO(req, sizeof(struct gnu_request));
 
-#ifdef GDB_7_0
 	if ((lm->mod_flags & MOD_KALLSYMS) &&
 	    add_symbol_file_kallsyms(lm, req))
 		return TRUE;
-#endif
+
 	for (i = len = 0; i < lm->mod_sections; i++)
 	{
 		secname = lm->mod_section_data[i].name;
 		if ((lm->mod_section_data[i].flags & SEC_FOUND) &&
-		    !STREQ(secname, ".text")) {
+		    (!STREQ(secname, ".text") &&
+		     !STREQ(secname, ".data.percpu") &&
+		     !STREQ(secname, ".data..percpu"))) {
 			sprintf(buf, " -s %s 0x%lx", secname, 
 				lm->mod_section_data[i].offset + lm->mod_base);
 			len += strlen(buf);
 		}
 	}
+
+	for (i = 0; i < lm->mod_sections; i++)
+	{
+		secname = lm->mod_section_data[i].name;
+		if ((lm->mod_section_data[i].flags & SEC_FOUND) &&
+		    (STREQ(secname, ".data.percpu") ||
+		     STREQ(secname, ".data..percpu"))) {
+			sprintf(buf, " -s %s 0x%lx", secname, lm->mod_percpu);
+			len += strlen(buf);
+		}
+	}
+
+	if (pc->curcmd_flags & MOD_READNOW)
+		lm->mod_flags |= MOD_DO_READNOW;
 
         req->command = GNU_ADD_SYMBOL_FILE;
 	req->addr = (ulong)lm;
@@ -8410,7 +11229,31 @@ add_symbol_file(struct load_module *lm)
 	return(!(req->flags & GNU_COMMAND_FAILED));
 }
 
-#ifdef GDB_7_0
+static int 
+add_symbol_file_percpu(struct load_module *lm, struct gnu_request *req, int buflen)
+{
+	char pbuf[BUFSIZE];
+	int i, len;
+	char *secname;
+
+	len = strlen(req->buf);
+	for (i = 0; i < lm->mod_sections; i++) {
+		secname = lm->mod_section_data[i].name;
+		if ((lm->mod_section_data[i].flags & SEC_FOUND) &&
+		    (STREQ(secname, ".data.percpu") ||
+		     STREQ(secname, ".data..percpu"))) {
+			sprintf(pbuf, " -s %s 0x%lx", secname, lm->mod_percpu);
+			while ((len + strlen(pbuf)) >= buflen) {
+				RESIZEBUF(req->buf, buflen, buflen * 2);
+				buflen *= 2;
+			}
+			strcat(req->buf, pbuf);
+			len += strlen(pbuf);
+		}
+	}
+	return buflen;
+}
+
 /*
  *  Gather the module section data from the in-kernel data structures.
  */
@@ -8424,7 +11267,10 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 	char section_name[BUFSIZE];
 	ulong section_vaddr;
 
-	if (!(st->flags & (MODSECT_V1|MODSECT_V2|MODSECT_V3|MODSECT_UNKNOWN))) {
+#if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1)
+	return FALSE;
+#endif
+	if (!(st->flags & (MODSECT_VMASK|MODSECT_UNKNOWN))) {
 		STRUCT_SIZE_INIT(module_sect_attr, "module_sect_attr");
 		MEMBER_OFFSET_INIT(module_sect_attrs, 
 			"module", "sect_attrs");
@@ -8464,7 +11310,8 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 
 		if ((st->flags & MODSECT_UNKNOWN) || 
 		    !VALID_STRUCT(module_sect_attr) ||
-		    INVALID_MEMBER(attribute_owner) ||
+		    (INVALID_MEMBER(attribute_owner) && 
+		     (st->flags & (MODSECT_V1|MODSECT_V2))) ||
 		    INVALID_MEMBER(module_sect_attrs) ||
 		    INVALID_MEMBER(module_sect_attr_name) ||
 		    INVALID_MEMBER(module_sect_attr_address)) {
@@ -8472,6 +11319,8 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 				error(WARNING, 
 				    "module section data structures "
 				    "unrecognized or changed\n");
+			st->flags &= ~(MODSECT_VMASK);
+			st->flags |= MODSECT_UNKNOWN;
 			return FALSE;
 		}
 	} else if (st->flags & MODSECT_UNKNOWN)
@@ -8484,7 +11333,7 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 
 	array_entry = attribute = 0;
 
-	switch (st->flags & (MODSECT_V1|MODSECT_V2|MODSECT_V3))
+	switch (st->flags & MODSECT_VMASK)
 	{
 	case MODSECT_V1:
 		array_entry = vaddr + OFFSET(module_sections_attrs);
@@ -8514,7 +11363,7 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 
 	for (done = FALSE; !done; array_entry += SIZE(module_sect_attr)) {
 
-		switch (st->flags & (MODSECT_V1|MODSECT_V2|MODSECT_V3))
+		switch (st->flags & MODSECT_VMASK)
 		{
 		case MODSECT_V1:
 			attribute = array_entry + OFFSET(module_sect_attr_attr);
@@ -8526,7 +11375,11 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 			break;
 		}
 	
-		owner = attribute + OFFSET(attribute_owner);
+		if (st->flags & (MODSECT_V1|MODSECT_V2))
+			owner = attribute + OFFSET(attribute_owner);
+		else
+			owner = UNUSED;
+
 		address = array_entry + OFFSET(module_sect_attr_address);
 		switch (name_type)
 		{
@@ -8549,7 +11402,10 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 
 		if (CRASHDEBUG(2)) {
 			fprintf(fp, "attribute: %lx ", attribute);
-			fprintf(fp, "    owner: %lx ", owner);
+			if (owner == UNUSED)
+				fprintf(fp, "    owner: (not used)");
+			else
+				fprintf(fp, "    owner: %lx ", owner);
 			fprintf(fp, "     name: %lx ", name);
 			fprintf(fp, "  address: %lx\n", address);
 		}
@@ -8587,8 +11443,9 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 		len = strlen(req->buf);
 
 		if (STREQ(section_name, ".text")) {
-			sprintf(buf, "add-symbol-file %s 0x%lx", 
-				lm->mod_namelist, section_vaddr);
+			sprintf(buf, "add-symbol-file %s 0x%lx %s", 
+				lm->mod_namelist, section_vaddr,
+				pc->curcmd_flags & MOD_READNOW ? "-readnow" : "");
 			while ((len + strlen(buf)) >= buflen) {
 				RESIZEBUF(req->buf, buflen, buflen * 2);
 				buflen *= 2;
@@ -8620,6 +11477,11 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 		return FALSE;
 	}
 
+	/* 
+	 * Special case for per-cpu symbols 
+	 */
+	buflen = add_symbol_file_percpu(lm, req, buflen);
+
 	lm->mod_flags |= MOD_NOPATCH;
         req->command = GNU_ADD_SYMBOL_FILE;
 	req->addr = (ulong)lm;
@@ -8636,7 +11498,6 @@ add_symbol_file_kallsyms(struct load_module *lm, struct gnu_request *req)
 
 	return(!(req->flags & GNU_COMMAND_FAILED));
 }
-#endif
 
 
 /*
@@ -8655,9 +11516,11 @@ load_module_index(struct syment *sp)
         for (i = 0; i < st->mods_installed; i++) {
                 lm = &st->load_modules[i];
 
-                if ((value >= lm->mod_base) &&
-                    (value < (lm->mod_base + lm->mod_size))) 
+		if (IN_MODULE(value, lm))
                         return i;
+
+		if (IN_MODULE_INIT(value, lm))
+			return i;
         }
 
 	return (error(FATAL, "cannot find %lx (%s) in module space\n",
@@ -8759,7 +11622,7 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
 
 	if (!lm->mod_load_symtable) {
 	        if ((lm->mod_load_symtable = (struct syment *)
-	             malloc(symalloc * sizeof(struct syment))) == NULL)
+	             calloc(symalloc, sizeof(struct syment))) == NULL)
 	                error(FATAL, "module syment space malloc: %s\n",
 	                        strerror(errno));
 
@@ -8897,7 +11760,12 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
 				else if ((spx = kallsyms_module_symbol(lm, &syminfo))) {
 					syminfo.value = spx->value;
 					found = TRUE;
-                                } else {
+				} else if (lm->mod_percpu &&
+					(STREQ(secname, ".data.percpu") ||
+					STREQ(secname, ".data..percpu"))) {
+					syminfo.value += lm->mod_percpu;
+					found = TRUE;
+				} else {
                                         syminfo.value += lm->mod_section_data[i].offset + lm->mod_base;
                                         found = TRUE;
                                 }
@@ -8907,11 +11775,12 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
                 if (found) {
                         strcpy(name, syminfo.name);
                         strip_module_symbol_end(name);
-
+			strip_symbol_end(name, NULL);
                         if (machdep->verify_symbol(name, syminfo.value,
                             syminfo.type)) {
                                 sp->value = syminfo.value;
                                 sp->type = syminfo.type;
+				sp->flags |= MODULE_SYMBOL;
                                 namespace_ctl(NAMESPACE_INSTALL,
                                         &lm->mod_load_namespace, sp, name);
 
@@ -8968,9 +11837,44 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
 
 			lm->mod_load_symend->value = spx->value;
 			lm->mod_load_symend->type = spx->type;
+			lm->mod_load_symend->flags |= MODULE_SYMBOL;
 			lm->mod_load_symend++;
 			lm->mod_load_symcnt++;
 		} 
+	}
+
+	/*
+	 * Append helpful pseudo symbols about found out sections.
+	 * Use 'S' as its type which is never seen in existing symbols.
+	 */
+	for (i = 0; (pc->curcmd_flags & MOD_SECTIONS) && 
+	     (i < lm->mod_sections); i++) {
+		if (!(lm->mod_section_data[i].flags & SEC_FOUND))
+			continue;
+		/* Section start */
+		lm->mod_load_symend->value = lm->mod_base +
+					     lm->mod_section_data[i].offset;
+		lm->mod_load_symend->type = 'S';
+		lm->mod_load_symend->flags |= MODULE_SYMBOL;
+		sprintf(name, "_MODULE_SECTION_START [%s]",
+			lm->mod_section_data[i].name);
+		namespace_ctl(NAMESPACE_INSTALL, &lm->mod_load_namespace,
+			      lm->mod_load_symend, name);
+		lm->mod_load_symend++;
+		lm->mod_load_symcnt++;
+
+		/* Section end */
+		lm->mod_load_symend->value = lm->mod_base +
+					     lm->mod_section_data[i].offset +
+					     lm->mod_section_data[i].size;
+		lm->mod_load_symend->type = 'S';
+		lm->mod_load_symend->flags |= MODULE_SYMBOL;
+		sprintf(name, "_MODULE_SECTION_END [%s]",
+			lm->mod_section_data[i].name);
+		namespace_ctl(NAMESPACE_INSTALL, &lm->mod_load_namespace,
+			      lm->mod_load_symend, name);
+		lm->mod_load_symend++;
+		lm->mod_load_symcnt++;
 	}
 
         namespace_ctl(NAMESPACE_COMPLETE, &lm->mod_load_namespace, 
@@ -8980,9 +11884,10 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
                 compare_syms);
 
 	lm->mod_load_symend--;
-	if (!MODULE_END(lm->mod_load_symend))
-		error(INFO, "%s: last symbol is not _MODULE_END_%s?\n",
-			lm->mod_name, lm->mod_name);
+	if (!MODULE_END(lm->mod_load_symend) &&
+	    !IN_MODULE_PERCPU(lm->mod_load_symend->value, lm))
+		error(INFO, "%s: last symbol: %s is not _MODULE_END_%s?\n",
+			lm->mod_name, lm->mod_load_symend->name, lm->mod_name);
 
         lm->mod_symtable = lm->mod_load_symtable;
         lm->mod_symend = lm->mod_load_symend;
@@ -8991,7 +11896,6 @@ store_load_module_symbols(bfd *bfd, int dynamic, void *minisyms,
 	lm->mod_flags |= MOD_LOAD_SYMS;
 
 	st->flags |= LOAD_MODULE_SYMS;
-
 }
 
 /*
@@ -9034,6 +11938,7 @@ delete_load_module(ulong base_addr)
 			lm->mod_text_start = lm->mod_data_start = 0; 
 			lm->mod_bss_start = lm->mod_rodata_start = 0;
 			lm->mod_sections = 0;
+			lm->mod_percpu_size = 0;
 			if (lm->mod_section_data)
 				free(lm->mod_section_data);
 			lm->mod_section_data = (struct mod_section_data *)0;
@@ -9068,6 +11973,7 @@ delete_load_module(ulong base_addr)
                         lm->mod_load_symcnt = lm->mod_symalloc = 0;
                         lm->mod_text_start = lm->mod_data_start = 0;
 			lm->mod_bss_start = lm->mod_rodata_start = 0;
+			lm->mod_percpu_size = 0;
 			lm->mod_sections = 0;
 			if (lm->mod_section_data)
 				free(lm->mod_section_data);
@@ -9273,6 +12179,20 @@ numeric_forward(const void *P_x, const void *P_y)
   	y = bfd_minisymbol_to_symbol(gnu_sort_bfd, FALSE, P_y, gnu_sort_y);
   	if (x == NULL || y == NULL)
 		error(FATAL, "bfd_minisymbol_to_symbol failed\n");
+
+	if (st->_stext_vmlinux == UNINITIALIZED) {
+		if (STREQ(x->name, "_stext"))
+			st->_stext_vmlinux = valueof(x);
+		else if (STREQ(y->name, "_stext"))
+			st->_stext_vmlinux = valueof(y);
+	}
+	if (kt->flags2 & KASLR_CHECK) {
+		if (STREQ(x->name, "module_load_offset") || 
+		    STREQ(y->name, "module_load_offset")) {
+			kt->flags2 &= ~KASLR_CHECK;
+			kt->flags2 |= (RELOC_AUTO|KASLR);
+		}
+	}
 
   	xs = bfd_get_section(x);
   	ys = bfd_get_section(y);
@@ -9509,7 +12429,6 @@ clear_text_value_cache(void)
  *  new one.
  */
 
-#define allocated pad1
 #define last_sp addr2
 
 int 
@@ -9523,6 +12442,10 @@ patch_kernel_symbol(struct gnu_request *req)
 			error(WARNING, 
 			    "\nkernel relocated [%ldMB]: patching %ld gdb minimal_symbol values\n",
 				kt->relocate >> 20, st->symcnt);
+		if (kt->flags2 & RELOC_AUTO)
+			error(WARNING, 
+			    "\nkernel relocated [%ldMB]: patching %ld gdb minimal_symbol values\n",
+				(kt->relocate * -1) >> 20, st->symcnt);
                 fprintf(fp, (pc->flags & SILENT) || !(pc->flags & TTY) ? "" :
                  "\nplease wait... (patching %ld gdb minimal_symbol values) ",
 			st->symcnt);
@@ -9545,10 +12468,10 @@ patch_kernel_symbol(struct gnu_request *req)
 
 	sp = (struct syment *)req->last_sp; 
 	sp += sp ? 1 : 0;
-	if (sp && (sp->cnt == 1) && !(sp->allocated) && 
+	if (sp && (sp->cnt == 1) && !(sp->flags & SYMBOL_NAME_USED) && 
 	    STREQ(sp->name, req->name)) {
                 *((ulong *)req->addr) = sp->value;
-                sp->allocated = TRUE;
+                sp->flags |= SYMBOL_NAME_USED;
                 req->last_sp = (ulong)sp;
 	} else {
 		switch (c = get_syment_array(req->name, sp_array, 1000))
@@ -9558,16 +12481,16 @@ patch_kernel_symbol(struct gnu_request *req)
 	
 		case 1: 
 			*((ulong *)req->addr) = sp_array[0]->value;
-			sp_array[0]->allocated = TRUE;
+			sp_array[0]->flags |= SYMBOL_NAME_USED;
 			req->last_sp = (ulong)sp_array[0];
 			break;
 	
 		default:
 			for (i = 0; i < c; i++) {
-				if (sp_array[i]->allocated)
+				if (sp_array[i]->flags & SYMBOL_NAME_USED)
 					continue;
 				*((ulong *)req->addr) = sp_array[i]->value;
-				sp_array[i]->allocated = TRUE;
+				sp_array[i]->flags |= SYMBOL_NAME_USED;
 				req->last_sp = (ulong)sp_array[i];
 				break;
 			}
@@ -9578,7 +12501,6 @@ patch_kernel_symbol(struct gnu_request *req)
 	return TRUE;
 }
 
-#undef allocated
 #undef last_sp
 
 /*
@@ -9859,4 +12781,89 @@ init_module_function(ulong vaddr)
 	}
 
 	return NULL;
+}
+
+/*
+ *  The caller fills in the structure and member name fields of
+ *  the passed-in struct_member_data structure, which are then
+ *  passed to the gdb "printm" command to get the member data.
+ *
+ *  Adapted from Qiao Nuohan's "pstruct" extension module.
+ */
+int
+fill_struct_member_data(struct struct_member_data *smd)
+{
+	int i, cnt;
+	char buf[BUFSIZE];
+	char *printm_list[MAXARGS];
+
+	cnt = 0;
+	sprintf(buf, "printm ((struct %s *)0x0).%s", 
+		smd->structure, smd->member);
+
+	open_tmpfile2();
+
+	if (!gdb_pass_through(buf, pc->tmpfile2, GNU_RETURN_ON_ERROR))
+		return FALSE;
+
+	rewind(pc->tmpfile2);
+	if (fgets(buf, BUFSIZE, pc->tmpfile2)) {
+		if (CRASHDEBUG(2))
+			fprintf(fp, "%s.%s: %s", 
+				smd->structure, smd->member, buf);
+		cnt = parse_line(buf, printm_list);
+	} 
+
+	close_tmpfile2();
+
+	if (cnt != 6)
+		return FALSE;
+	for (i = 0; i < cnt; i++) {
+		if (!decimal(printm_list[i], 0))
+			return FALSE;
+	}
+
+	smd->type = dtol(printm_list[0], RETURN_ON_ERROR, NULL);
+	smd->unsigned_type = dtol(printm_list[1], RETURN_ON_ERROR, NULL);
+	smd->length = dtol(printm_list[2], RETURN_ON_ERROR, NULL);
+	smd->offset = dtol(printm_list[3], RETURN_ON_ERROR, NULL);
+	smd->bitpos = dtol(printm_list[4], RETURN_ON_ERROR, NULL);
+	smd->bitsize = dtol(printm_list[5], RETURN_ON_ERROR, NULL);
+
+	return TRUE;
+}
+
+void
+add_to_downsized(char *name)
+{
+	struct downsized *ds;
+
+	ds = &st->downsized; 
+
+	while (ds->name)
+		ds = ds->next;
+
+	if (!(ds->name = (char *)malloc(strlen(name)+1)) ||
+	    !(ds->next = (struct downsized *)calloc(1, sizeof(struct downsized))))
+		error(FATAL, 
+		    "cannot calloc/malloc downsized struct or \"%s\" name string\n", name);
+
+	strcpy(ds->name, name);
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "%sadd_to_downsized: \"%s\"\n", 
+			(pc->flags & PLEASE_WAIT) ? "\n" : "", name);
+}
+
+int
+is_downsized(char *name)
+{
+	struct downsized *ds;
+
+	for (ds = &st->downsized; ds->name; ds = ds->next) {
+		if (STREQ(name, ds->name))
+			return TRUE;
+	}
+
+	return FALSE;
 }

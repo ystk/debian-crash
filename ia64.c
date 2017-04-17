@@ -1,8 +1,8 @@
 /* ia64.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2009, 2010 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2009, 2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2013 David Anderson
+ * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,12 +39,12 @@ static void ia64_get_stack_frame(struct bt_info *, ulong *, ulong *);
 static int ia64_translate_pte(ulong, void *, ulonglong);
 static ulong ia64_vmalloc_start(void);
 static int ia64_is_task_addr(ulong);
-static int ia64_dis_filter(ulong, char *);
+static int ia64_dis_filter(ulong, char *, unsigned int);
 static void ia64_dump_switch_stack(ulong, ulong);
 static void ia64_cmd_mach(void);
 static int ia64_get_smp_cpus(void);
 static void ia64_display_machine_stats(void);
-static void ia64_display_cpu_data(void);
+static void ia64_display_cpu_data(unsigned int);
 static void ia64_display_memmap(void);
 static void ia64_create_memmap(void);
 static ulong check_mem_limit(void);
@@ -57,6 +57,7 @@ static ulong ia64_get_stackbase(ulong);
 static ulong ia64_get_stacktop(ulong);
 static void parse_cmdline_args(void);
 static void ia64_calc_phys_start(void);
+static int ia64_get_kvaddr_ranges(struct vaddr_range *);
 
 struct unw_frame_info;
 static void dump_unw_frame_info(struct unw_frame_info *);
@@ -143,6 +144,7 @@ ia64_init(int when)
                 machdep->last_pmd_read = 0;
                 machdep->last_ptbl_read = 0;
 		machdep->verify_paddr = ia64_verify_paddr;
+		machdep->get_kvaddr_ranges = ia64_get_kvaddr_ranges;
 		machdep->ptrs_per_pgd = PTRS_PER_PGD;
                 machdep->machspec->phys_start = UNKNOWN_PHYS_START;
                 if (machdep->cmdline_args[0]) 
@@ -195,6 +197,8 @@ ia64_init(int when)
 		machdep->line_number_hooks = ia64_line_number_hooks;
 		machdep->value_to_symbol = generic_machdep_value_to_symbol;
                 machdep->init_kernel_pgd = NULL;
+		machdep->get_irq_affinity = generic_get_irq_affinity;
+		machdep->show_interrupts = generic_show_interrupts;
 
 		if ((sp = symbol_search("_stext"))) {
 			machdep->machspec->kernel_region = 
@@ -256,6 +260,19 @@ ia64_init(int when)
 
 	case POST_INIT:
 		ia64_post_init();
+		break;
+
+	case LOG_ONLY:
+		machdep->machspec = &ia64_machine_specific;
+		machdep->machspec->kernel_start = kt->vmcoreinfo._stext_SYMBOL;
+		machdep->machspec->kernel_region = 
+			VADDR_REGION(kt->vmcoreinfo._stext_SYMBOL);
+		if (machdep->machspec->kernel_region == KERNEL_VMALLOC_REGION) {
+			machdep->machspec->vmalloc_start = 
+				machdep->machspec->kernel_start +
+				GIGABYTES((ulong)(4));
+			ia64_calc_phys_start();
+		}
 		break;
 	}
 }
@@ -575,11 +592,14 @@ ia64_dump_machdep_table(ulong arg)
         fprintf(fp, "         dis_filter: ia64_dis_filter()\n");
         fprintf(fp, "           cmd_mach: ia64_cmd_mach()\n");
         fprintf(fp, "       get_smp_cpus: ia64_get_smp_cpus()\n");
+	fprintf(fp, "  get_kvaddr_ranges: ia64_get_kvaddr_ranges()\n");
         fprintf(fp, "          is_kvaddr: generic_is_kvaddr()\n");
         fprintf(fp, "          is_uvaddr: generic_is_uvaddr()\n");
         fprintf(fp, "       verify_paddr: %s()\n",
 		(machdep->verify_paddr == ia64_verify_paddr) ?
 		"ia64_verify_paddr" : "generic_verify_paddr");
+	fprintf(fp, "   get_irq_affinity: generic_get_irq_affinity()\n");
+	fprintf(fp, "    show_interrupts: generic_show_interrupts()\n");
         fprintf(fp, "    init_kernel_pgd: NULL\n");
 	fprintf(fp, "xen_kdump_p2m_create: ia64_xen_kdump_p2m_create()\n");
         fprintf(fp, " xendump_p2m_create: ia64_xendump_p2m_create()\n");
@@ -710,6 +730,9 @@ ia64_verify_symbol(const char *name, ulong value, char type)
 
 	if (!name || !strlen(name))
 		return FALSE;
+
+	if (XEN_HYPER_MODE() && STREQ(name, "__per_cpu_shift"))
+		return TRUE;
 
         if (CRASHDEBUG(8))
                 fprintf(fp, "%016lx %s\n", value, name);
@@ -887,7 +910,7 @@ ia64_vtop_4l(ulong vaddr, physaddr_t *paddr, ulong *pgd, int verbose, int usr)
         if (verbose)
                 fprintf(fp, "   PTE: %lx => %lx\n", (ulong)page_table, pte);
 
-        if (!(pte & (_PAGE_P))) {
+        if (!(pte & (_PAGE_P | _PAGE_PROTNONE))) {
 		if (usr)
 		  	*paddr = pte;
 		if (pte && verbose) {
@@ -965,7 +988,7 @@ ia64_vtop(ulong vaddr, physaddr_t *paddr, ulong *pgd, int verbose, int usr)
         if (verbose)
                 fprintf(fp, "   PTE: %lx => %lx\n", (ulong)page_table, pte);
 
-        if (!(pte & (_PAGE_P))) {
+        if (!(pte & (_PAGE_P | _PAGE_PROTNONE))) {
 		if (usr)
 		  	*paddr = pte;
 		if (pte && verbose) {
@@ -1231,7 +1254,7 @@ ia64_translate_pte(ulong pte, void *physaddr, ulonglong unused)
 	ulong paddr;
 
         paddr = pte & _PFN_MASK;
-	page_present = pte & _PAGE_P;
+	page_present = !!(pte & (_PAGE_P | _PAGE_PROTNONE));
 
 	if (physaddr) {
 		*((ulong *)physaddr) = paddr;
@@ -1399,7 +1422,7 @@ ia64_is_task_addr(ulong task)
  *  Filter disassembly output if the output radix is not gdb's default 10
  */
 static int
-ia64_dis_filter(ulong vaddr, char *inbuf)
+ia64_dis_filter(ulong vaddr, char *inbuf, unsigned int output_radix)
 {
         char buf1[BUFSIZE];
         char buf2[BUFSIZE];
@@ -1423,7 +1446,7 @@ ia64_dis_filter(ulong vaddr, char *inbuf)
 
         if (colon) {
                 sprintf(buf1, "0x%lx <%s>", vaddr,
-                        value_to_symstr(vaddr, buf2, pc->output_radix));
+                        value_to_symstr(vaddr, buf2, output_radix));
                 sprintf(buf2, "%s%s", buf1, colon);
                 strcpy(inbuf, buf2);
         }
@@ -1454,7 +1477,7 @@ ia64_dis_filter(ulong vaddr, char *inbuf)
                         return FALSE;
 
                 sprintf(buf1, "0x%lx <%s>%s\n", value,
-                        value_to_symstr(value, buf2, pc->output_radix),
+                        value_to_symstr(value, buf2, output_radix),
 			stop_bit ? ";;" : "");
 
                 sprintf(p1, "%s", buf1);
@@ -1478,10 +1501,10 @@ ia64_dis_filter(ulong vaddr, char *inbuf)
                 	if (extract_hex(p1, &value, NULLCHAR, TRUE)) {
 				sprintf(buf1, " <%s>;;\n",
 					value_to_symstr(value, buf2, 
-					pc->output_radix));
+					output_radix));
 				if (IS_MODULE_VADDR(value) &&
 				    !strstr(buf2, "+"))
-					sprintf(p2, buf1);
+					sprintf(p2, "%s", buf1);
 			} 
 		} else {
 			p1 = &argv[argc-1][3];
@@ -1489,10 +1512,10 @@ ia64_dis_filter(ulong vaddr, char *inbuf)
                 	if (extract_hex(p1, &value, '\n', TRUE)) {
 				sprintf(buf1, " <%s>\n",
 					value_to_symstr(value, buf2, 
-					pc->output_radix));
+					output_radix));
 				if (IS_MODULE_VADDR(value) &&
 				    !strstr(buf2, "+"))
-					sprintf(p2, buf1);
+					sprintf(p2, "%s", buf1);
 			}
 		}
 	}
@@ -2288,17 +2311,33 @@ ia64_get_smp_cpus(void)
 void
 ia64_cmd_mach(void)
 {
-        int c;
+        int c, cflag, mflag;
+	unsigned int radix;
 
-        while ((c = getopt(argcnt, args, "cm")) != EOF) {
+	cflag = mflag = radix = 0;
+
+        while ((c = getopt(argcnt, args, "cmxd")) != EOF) {
                 switch(c)
                 {
 		case 'c':
-			ia64_display_cpu_data();
-			return;
+			cflag++;
+			break;
 		case 'm':
+			mflag++;
 			ia64_display_memmap();
-			return;
+			break;
+		case 'x':
+			if (radix == 10)
+				error(FATAL,
+					"-d and -x are mutually exclusive\n");
+			radix = 16;
+			break;
+		case 'd':
+			if (radix == 16)
+				error(FATAL,
+					"-d and -x are mutually exclusive\n");
+			radix = 10;
+			break;
                 default:
                         argerrs++;
                         break;
@@ -2308,7 +2347,11 @@ ia64_cmd_mach(void)
         if (argerrs)
                 cmd_usage(pc->curcmd, SYNOPSIS);
 
-	ia64_display_machine_stats();
+	if (cflag)
+		ia64_display_cpu_data(radix);
+
+	if (!cflag && !mflag)
+		ia64_display_machine_stats();
 }
 
 /*
@@ -2326,6 +2369,9 @@ ia64_display_machine_stats(void)
         fprintf(fp, "              MACHINE TYPE: %s\n", uts->machine);
         fprintf(fp, "               MEMORY SIZE: %s\n", get_memory_size(buf));
         fprintf(fp, "                      CPUS: %d\n", kt->cpus);
+	if (!STREQ(kt->hypervisor, "(undetermined)") &&
+	    !STREQ(kt->hypervisor, "bare hardware"))
+		fprintf(fp, "                HYPERVISOR: %s\n",  kt->hypervisor);
         fprintf(fp, "           PROCESSOR SPEED: ");
         if ((mhz = machdep->processor_speed()))
                 fprintf(fp, "%ld Mhz\n", mhz);
@@ -2354,7 +2400,7 @@ ia64_display_machine_stats(void)
 }
 
 static void 
-ia64_display_cpu_data(void)
+ia64_display_cpu_data(unsigned int radix)
 {
         int cpu;
 	ulong cpu_data;
@@ -2372,7 +2418,7 @@ ia64_display_cpu_data(void)
         for (cpu = 0; cpu < kt->cpus; cpu++) {
                 fprintf(fp, "%sCPU %d: %s\n", cpu ? "\n" : "", cpu,
 			array_location_known ? "" : "(boot)");
-                dump_struct("cpuinfo_ia64", cpu_data, 0);
+                dump_struct("cpuinfo_ia64", cpu_data, radix);
 
 		if (!array_location_known)
 			break;
@@ -2887,7 +2933,8 @@ ia64_post_init(void)
 				&ms->cpu_data_address);
 		else if (symbol_exists("cpu_data"))
 			ms->cpu_data_address = symbol_value("cpu_data");
-		else if ((sp = per_cpu_symbol_search("per_cpu__cpu_info"))) {
+		else if ((sp = per_cpu_symbol_search("per_cpu__cpu_info")) ||
+		         (sp = per_cpu_symbol_search("per_cpu__ia64_cpu_info"))) {
 			if ((kt->flags & SMP) && (kt->flags & PER_CPU_OFF))
 				ms->cpu_data_address = sp->value +
 					kt->__per_cpu_offset[0];
@@ -3567,6 +3614,59 @@ ia64_IS_VMALLOC_ADDR(ulong vaddr)
         	(vaddr < (ulong)KERNEL_UNCACHED_BASE));
 }
 
+static int
+compare_kvaddr(const void *v1, const void *v2)
+{
+	struct vaddr_range *r1, *r2;
+
+	r1 = (struct vaddr_range *)v1;
+	r2 = (struct vaddr_range *)v2;
+
+	return (r1->start < r2->start ? -1 :
+		r1->start == r2->start ? 0 : 1);
+}
+
+static int 
+ia64_get_kvaddr_ranges(struct vaddr_range *vrp)
+{
+	int cnt;
+
+	cnt = 0;
+
+	vrp[cnt].type = KVADDR_UNITY_MAP;
+	vrp[cnt].start = machdep->identity_map_base;
+	vrp[cnt++].end = vt->high_memory;
+
+	if (machdep->machspec->kernel_start != machdep->identity_map_base) {
+		vrp[cnt].type = KVADDR_START_MAP;
+		vrp[cnt].start = machdep->machspec->kernel_start;
+		vrp[cnt++].end = kt->end;
+	}
+
+	vrp[cnt].type = KVADDR_VMALLOC;
+	vrp[cnt].start = machdep->machspec->vmalloc_start;
+	vrp[cnt++].end = (ulong)KERNEL_UNCACHED_REGION << REGION_SHIFT;
+
+	if (VADDR_REGION(vt->node_table[0].mem_map) == KERNEL_VMALLOC_REGION) {
+		vrp[cnt].type = KVADDR_VMEMMAP;
+		vrp[cnt].start = vt->node_table[0].mem_map;
+		vrp[cnt].end = vt->node_table[vt->numnodes-1].mem_map +
+			(vt->node_table[vt->numnodes-1].size *  
+			 SIZE(page));
+		/*
+		 * Prevent overlap with KVADDR_VMALLOC range.
+		 */
+		if (vrp[cnt].start > vrp[cnt-1].start)
+			vrp[cnt-1].end = vrp[cnt].start;
+		cnt++;
+	}
+
+	qsort(vrp, cnt, sizeof(struct vaddr_range), compare_kvaddr);
+
+	return cnt;
+}
+
+
 /* Generic abstraction to translate user or kernel virtual
  * addresses to physical using a 4 level page table.
  */
@@ -3748,6 +3848,7 @@ ia64_vtop_xen_wpt(ulong vaddr, physaddr_t *paddr, ulong *pgd, int verbose, int u
 }
 
 #include "netdump.h"
+#include "xen_dom0.h"
 
 /*
  *  Determine the relocatable physical address base.
@@ -3761,8 +3862,8 @@ ia64_calc_phys_start(void)
 	char *p1;
 	ulong kernel_code_start;
 	struct vmcore_data *vd;
-	Elf64_Phdr *phdr;
 	ulong phys_start, text_start;
+	Elf64_Phdr *phdr = NULL;
 
 	/*
 	 *  Default to 64MB.
@@ -3882,13 +3983,14 @@ static int
 ia64_xen_kdump_p2m_create(struct xen_kdump_data *xkd)
 {
 	/*
-	 *  Temporarily read physical (machine) addresses from vmcore by
-	 *  going directly to read_netdump() instead of via read_kdump().
+	 *  Temporarily read physical (machine) addresses from vmcore.
 	 */
-	pc->readmem = read_netdump;
+	pc->curcmd_flags |= XEN_MACHINE_ADDR;
 
-	if (CRASHDEBUG(1))
+	if (CRASHDEBUG(1)) {
+		fprintf(fp, "readmem (temporary): force XEN_MACHINE_ADDR\n");
 		fprintf(fp, "ia64_xen_kdump_p2m_create: p2m_mfn: %lx\n", xkd->p2m_mfn);
+	}
 
 	if ((xkd->p2m_mfn_frame_list = (ulong *)malloc(PAGESIZE())) == NULL)
 		error(FATAL, "cannot malloc p2m_frame_list");
@@ -3899,7 +4001,9 @@ ia64_xen_kdump_p2m_create(struct xen_kdump_data *xkd)
 
 	xkd->p2m_frames = PAGESIZE()/sizeof(ulong);
 
-	pc->readmem = read_kdump;
+	pc->curcmd_flags &= ~XEN_MACHINE_ADDR;
+	if (CRASHDEBUG(1))
+		fprintf(fp, "readmem (restore): p2m translation\n");
 
 	return TRUE;
 }
@@ -3912,10 +4016,11 @@ ia64_xen_kdump_p2m(struct xen_kdump_data *xkd, physaddr_t pseudo)
 	physaddr_t paddr;
 
 	/*
-	 *  Temporarily read physical (machine) addresses from vmcore by
-	 *  going directly to read_netdump() instead of via read_kdump().
+	 *  Temporarily read physical (machine) addresses from vmcore.
 	 */
-	pc->readmem = read_netdump;
+	pc->curcmd_flags |= XEN_MACHINE_ADDR;
+	if (CRASHDEBUG(1))
+		fprintf(fp, "readmem (temporary): force XEN_MACHINE_ADDR\n");
 
 	xkd->accesses += 2;
 
@@ -3967,7 +4072,10 @@ ia64_xen_kdump_p2m(struct xen_kdump_data *xkd, physaddr_t pseudo)
 	paddr = (paddr & _PFN_MASK) | PAGEOFFSET(pseudo);
 
 out:
-	pc->readmem = read_kdump;
+	pc->curcmd_flags &= ~XEN_MACHINE_ADDR;
+	if (CRASHDEBUG(1))
+		fprintf(fp, "readmem (restore): p2m translation\n");
+
 	return paddr;
 }
 

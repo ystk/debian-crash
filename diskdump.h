@@ -42,7 +42,9 @@ struct disk_dump_header {
 						   header in blocks */
 	unsigned int		bitmap_blocks;	/* Size of Memory bitmap in
 						   block */
-	unsigned int		max_mapnr;	/* = max_mapnr */
+	unsigned int		max_mapnr;	/* = max_mapnr, OBSOLETE!
+						   32bit only, full 64bit
+						   in sub header. */
 	unsigned int		total_ram_blocks;/* Number of blocks should be
 						   written */
 	unsigned int		device_blocks;	/* Number of total blocks in
@@ -59,14 +61,31 @@ struct disk_dump_sub_header {
 
 struct kdump_sub_header {
 	unsigned long	phys_base;
-	int		dump_level;  /* header_version 1 and later */
-	int		split;       /* header_version 2 and later */
-	unsigned long start_pfn; /* header_version 2 and later */
-	unsigned long end_pfn;   /* header_version 2 and later */
+	int		dump_level;         /* header_version 1 and later */
+	int		split;              /* header_version 2 and later */
+	unsigned long	start_pfn;          /* header_version 2 and later,
+					       OBSOLETE! 32bit only, full 64bit
+					       in start_pfn_64. */
+	unsigned long	end_pfn;            /* header_version 2 and later,
+					       OBSOLETE! 32bit only, full 64bit
+					       in end_pfn_64. */
+	off_t		offset_vmcoreinfo;  /* header_version 3 and later */
+	unsigned long	size_vmcoreinfo;    /* header_version 3 and later */
+	off_t		offset_note;        /* header_version 4 and later */
+	unsigned long	size_note;          /* header_version 4 and later */
+	off_t		offset_eraseinfo;   /* header_version 5 and later */
+	unsigned long	size_eraseinfo;     /* header_version 5 and later */
+	unsigned long long start_pfn_64;    /* header_version 6 and later */
+	unsigned long long end_pfn_64;      /* header_version 6 and later */
+	unsigned long long max_mapnr_64;    /* header_version 6 and later */
 };
 
 /* page flags */
-#define DUMP_DH_COMPRESSED	0x1	/* page is compressed               */
+#define DUMP_DH_COMPRESSED_ZLIB    0x1   /* page is compressed with zlib */
+#define DUMP_DH_COMPRESSED_LZO     0x2   /* page is compressed with lzo */
+#define DUMP_DH_COMPRESSED_SNAPPY  0x4   /* page is compressed with snappy */
+#define DUMP_DH_COMPRESSED_INCOMPLETE  0x8   /* dumpfile is incomplete */
+#define DUMP_DH_EXCLUDED_VMEMMAP   0x10  /* unused vmemmap pages are excluded */
 
 /* descriptor of each page for vmcore */
 typedef struct page_desc {
